@@ -190,7 +190,12 @@ class ActionExecutor:
         self.bash_session: BashSession | 'WindowsPowershellSession' | None = None  # type: ignore[name-defined]
         self.lock = asyncio.Lock()
         self.plugins: dict[str, Plugin] = {}
-        self.file_editor = OHEditor(workspace_root=self._initial_cwd)
+        if os.environ.get('OH_FUZZY_STR_REPLACE', '1') != '0':
+            from openhands.runtime.latent_fuzzy_editor import FuzzyOHEditor
+
+            self.file_editor: OHEditor = FuzzyOHEditor(workspace_root=self._initial_cwd)
+        else:
+            self.file_editor = OHEditor(workspace_root=self._initial_cwd)
         self.enable_browser = enable_browser
         self.browser: BrowserEnv | None = None
         self.browser_init_task: asyncio.Task | None = None
