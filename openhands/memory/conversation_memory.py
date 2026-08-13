@@ -5,6 +5,9 @@ from litellm import ModelResponse
 from openhands.core.config.agent_config import AgentConfig
 from openhands.core.logger import openhands_logger as logger
 from openhands.core.message import ImageContent, Message, TextContent
+from openhands.memory.latent_observation_policy import (
+    apply_latent_observation_policy,
+)
 from openhands.core.schema import ActionType
 from openhands.events.action import (
     Action,
@@ -161,6 +164,9 @@ class ConversationMemory:
 
         # Apply final formatting
         messages = self._apply_user_message_formatting(messages)
+
+        # Latent observation channel policy (no-op unless LATENT_OBS_POLICY is set)
+        messages = apply_latent_observation_policy(messages)
 
         return messages
 
