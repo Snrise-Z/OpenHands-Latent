@@ -9,22 +9,38 @@
 本模块在上游精确匹配失败("did not appear verbatim")后追加两层回退:
 
   第二层  行级空白归一化: 按"逐行去首尾空白后的行序列"在文件中找唯一的连续
-          行窗口; 命中后, 若各行缩进偏移恒定, 对 new_str 施加同一偏移。
+          行窗口。
   第三层  半全局编辑距离(Sellers 动态规划, O(|P|*|T|), numpy 向量化):
           接受条件 = 归一化距离 <= FUZZY_MAX_DISTANCE(缺省 0.15)
           且不相交次优间隔 >= FUZZY_MIN_MARGIN(缺省 0.05)。
           间隔门是唯一性的操作化判据: 代码自相似导致的多候选会在这里被拒,
           并把候选行号列表返回给模型(比"逐字不匹配"可操作得多)。
 
+命中之后有两道保护, 都是被真实故障逼出来的:
+
+  缩进重排  模型的引用常常只有部分行丢了缩进(例如前两行 8 空格、后几行 4 空格),
+            此时"恒定偏移"不成立。早先的实现在这种情况下直接把 new_str 原样写回,
+            结果把方法体末尾几行移出了函数, 文件变成 'return' outside function
+            —— 补丁看着命中、实际不可编译。现在改为: 用 difflib 在去首尾空白的
+            行序列上对齐 old_str 与 new_str, 对齐上的行一律沿用**文件里那一行的
+            真实缩进**, 新增行按模型给的相对缩进锚定到最近的对齐行。
+  语法闸门  写回前对 .py 做一次 compile。编辑前能编译、编辑后不能, 就不写,
+            按普通拒绝返回并附上语法错误 —— 把静默损坏变成一次可纠正的失败。
+            OH_FUZZY_SYNTAX_GUARD=0 可关闭。
+
 安全边界: 过短模式(有效字符 < 40)不进入回退层; 非精确层的成功消息中回显
 实际被替换的原文, 模型可自查; "Multiple occurrences" 类错误(歧义)原样透传,
 不做模糊消解。环境变量 OH_FUZZY_STR_REPLACE=0 整体关闭, 行为回到上游。
+每次回退层命中都会打一条 [fuzzy-editor] 日志 —— 否则事后无法从轨迹里统计
+到底触发了几次(这正是八组矩阵复盘时踩到的观测缺口)。
 """
 
+import difflib
 import os
 import re
 from pathlib import Path
 
+from openhands.core.logger import openhands_logger as logger
 from openhands_aci.editor.editor import OHEditor
 from openhands_aci.editor.exceptions import ToolError
 from openhands_aci.editor.results import CLIResult
@@ -47,6 +63,64 @@ def _strip_lines(s: str) -> list[str]:
 
 def _indent_of(line: str) -> str:
     return line[: len(line) - len(line.lstrip())]
+
+
+def _reindent_to_window(window: str, old_str: str, new_str: str) -> str:
+    """把 new_str 的缩进对齐到文件窗口的真实缩进。
+
+    仅在窗口与引用行数一致时生效(第二层总是成立; 第三层的字符级窗口可能不成立,
+    那时原样返回, 由语法闸门兜底)。
+    """
+    w_lines = window.splitlines()
+    o_lines = old_str.splitlines()
+    n_lines = new_str.splitlines()
+    if not n_lines or len(w_lines) != len(o_lines):
+        return new_str
+
+    out: list[str | None] = [None] * len(n_lines)
+    matcher = difflib.SequenceMatcher(
+        a=[ln.strip() for ln in o_lines], b=[ln.strip() for ln in n_lines]
+    )
+    for tag, i1, _i2, j1, j2 in matcher.get_opcodes():
+        if tag != 'equal':
+            continue  # 改动行留给下面按锚点定位
+        for k in range(j2 - j1):
+            src = n_lines[j1 + k]
+            out[j1 + k] = (
+                _indent_of(w_lines[i1 + k]) + src.strip() if src.strip() else src
+            )
+
+    for j, val in enumerate(out):
+        if val is not None:
+            continue
+        src = n_lines[j]
+        if not src.strip():
+            out[j] = src
+            continue
+        anchor = next(
+            (
+                k
+                for k in range(j - 1, -1, -1)
+                if out[k] is not None and n_lines[k].strip()
+            ),
+            None,
+        )
+        if anchor is None:
+            anchor = next(
+                (
+                    k
+                    for k in range(j + 1, len(n_lines))
+                    if out[k] is not None and n_lines[k].strip()
+                ),
+                None,
+            )
+        if anchor is None:
+            out[j] = src
+            continue
+        delta = len(_indent_of(out[anchor])) - len(_indent_of(n_lines[anchor]))
+        out[j] = ' ' * max(0, len(_indent_of(src)) + delta) + src.lstrip()
+
+    return '\n'.join(out) + ('\n' if new_str.endswith('\n') else '')
 
 
 class FuzzyOHEditor(OHEditor):
@@ -97,7 +171,7 @@ class FuzzyOHEditor(OHEditor):
         # 否则替换会吞掉与下一行之间的换行符。
         if not old_str.endswith('\n') and file_content[end_idx - 1 : end_idx] == '\n':
             end_idx -= 1
-        # 恒定缩进偏移: 所有非空行的 (文件缩进 - 引用缩进) 一致才应用
+        # 缩进偏移是否恒定 —— 只用于给模型的提示文案, 重排一律走 _reindent_to_window
         deltas = set()
         p_lines = old_str.splitlines()
         for k in range(m):
@@ -105,10 +179,8 @@ class FuzzyOHEditor(OHEditor):
                 deltas.add(
                     (len(_indent_of(f_lines[i + k])), len(_indent_of(p_lines[k])))
                 )
-        delta = None
         offsets = {fi - pi for fi, pi in deltas}
-        if len(offsets) == 1:
-            delta = offsets.pop()
+        delta = offsets.pop() if len(offsets) == 1 else None
         return start_idx, end_idx, delta
 
     # ------------------------------------------------------------- 第三层
@@ -163,12 +235,35 @@ class FuzzyOHEditor(OHEditor):
         e_char = len(tb[:end].decode('utf-8', 'ignore'))
         return s_char, e_char, d1, m
 
+    # -------------------------------------------------------------- 闸门
+    @staticmethod
+    def _guard_syntax(path, before: str, after: str) -> None:
+        """编辑前能编译、编辑后不能, 就不要写回。"""
+        if not str(path).endswith('.py'):
+            return
+        if os.environ.get('OH_FUZZY_SYNTAX_GUARD', '1') == '0':
+            return
+        try:
+            compile(before, str(path), 'exec')
+        except SyntaxError:
+            return  # 本来就不可编译, 不做判断
+        try:
+            compile(after, str(path), 'exec')
+        except SyntaxError as e:
+            raise ToolError(
+                f'No replacement was performed. old_str did not appear verbatim; the '
+                f'closest match in {path} was found, but applying new_str would break '
+                f'the file: {e.msg} (line {e.lineno}). Re-quote old_str exactly as it '
+                f'appears in the file, keeping the original indentation.'
+            )
+
     # -------------------------------------------------------------- 施加
     def _fuzzy_str_replace(self, path, old_str, new_str, enable_linting, orig_err):
         file_content = self.read_file(path)
 
         note = None
         span = None
+        tier = None
         m2 = self._match_normalized_lines(file_content, old_str)
         if isinstance(m2, tuple) and m2 and m2[0] == 'AMBIGUOUS':
             raise ToolError(
@@ -178,19 +273,12 @@ class FuzzyOHEditor(OHEditor):
             )
         if m2 is not None:
             start, end, delta = m2
-            if delta:
-                new_lines = []
-                for ln in new_str.splitlines(keepends=True):
-                    if ln.strip():
-                        new_lines.append(
-                            (' ' * max(0, len(_indent_of(ln)) + delta)) + ln.lstrip()
-                        )
-                    else:
-                        new_lines.append(ln)
-                new_str = ''.join(new_lines)
+            tier = 'normalized-lines'
+            new_str = _reindent_to_window(file_content[start:end], old_str, new_str)
             span = (start, end)
-            note = '[fuzzy-match: whitespace-normalized line match' + (
-                f', re-indented new_str by {delta:+d}]' if delta else ']'
+            note = (
+                '[fuzzy-match: whitespace-normalized line match, new_str re-indented '
+                'to the file]'
             )
         else:
             m3 = self._match_edit_distance(file_content, old_str)
@@ -203,12 +291,19 @@ class FuzzyOHEditor(OHEditor):
             if m3 is None:
                 return None
             start, end, d1, plen = m3
+            tier = 'edit-distance'
+            new_str = _reindent_to_window(file_content[start:end], old_str, new_str)
             span = (start, end)
             note = f'[fuzzy-match: edit-distance window, distance {d1}/{plen} chars]'
 
         start, end = span
         replaced = file_content[start:end]
         new_file_content = file_content[:start] + new_str + file_content[end:]
+        self._guard_syntax(path, file_content, new_file_content)
+        logger.info(
+            f'[fuzzy-editor] tier={tier} path={path} '
+            f'replaced_lines={replaced.count(chr(10)) + 1} note={note}'
+        )
         self.write_file(path, new_file_content)
         self._history_manager.add_history(path, file_content)
 
