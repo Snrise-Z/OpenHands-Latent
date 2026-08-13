@@ -61,7 +61,7 @@ class FuzzyOHEditor(OHEditor):
         encoding: str = 'utf-8',
     ) -> CLIResult:
         try:
-            return super().str_replace(path, old_str, new_str, enable_linting, encoding)
+            return super().str_replace(path, old_str, new_str, enable_linting)
         except ToolError as err:
             if 'did not appear verbatim' not in str(err):
                 raise  # 歧义等其他错误原样透传
