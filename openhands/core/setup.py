@@ -71,11 +71,17 @@ def create_runtime(
     # runtime and tools
     runtime_cls = get_runtime_cls(config.runtime)
     logger.debug(f'Initializing runtime: {runtime_cls.__name__}')
+    # 智能体关掉 Jupyter 时就别再加载它的运行时插件: 内核网关启动很重, 批量评测
+    # 并发起实例时会把动作执行服务器的就绪时间拖过客户端等待窗口(实测 ConnectError
+    # 秒杀实例), 而 enable_jupyter=false 下这个内核根本用不到。
+    plugins = list(agent_cls.sandbox_plugins)
+    if not config.get_agent_config(agent_cls.__name__).enable_jupyter:
+        plugins = [p for p in plugins if p.name != 'jupyter']
     runtime: Runtime = runtime_cls(
         config=config,
         event_stream=event_stream,
         sid=session_id,
-        plugins=agent_cls.sandbox_plugins,
+        plugins=plugins,
         headless_mode=headless_mode,
         llm_registry=llm_registry or LLMRegistry(config),
         git_provider_tokens=git_provider_tokens,
