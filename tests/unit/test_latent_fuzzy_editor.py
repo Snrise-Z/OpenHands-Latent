@@ -102,6 +102,98 @@ def test_disabled_falls_back_to_upstream(workspace, monkeypatch):
     assert f.read_text() == before
 
 
+TAB_FILE = (
+    'class Handler:\n'
+    '\tdef process(self, payload):\n'
+    '\t\tvalidated = self.validate(payload)\n'
+    '\t\tenriched = self.enrich(validated)\n'
+    '\t\tstored = self.store(enriched)\n'
+    '\t\treturn stored\n'
+)
+OLD_TAB = (
+    '    def process(self, payload):\n'
+    '        validated = self.validate(payload)\n'
+    '        enriched = self.enrich(validated)\n'
+    '        stored = self.store(enriched)\n'
+    '        return stored'
+)
+
+MAKEFILE = (
+    'all: build test\n'
+    '\techo building the project now\n'
+    '\techo running the test suite\n'
+    '\techo finished everything\n'
+    '\ntest:\n\techo test\n'
+)
+OLD_MK = (
+    'all: build test\n'
+    '    echo building the project now\n'
+    '    echo running the test suite\n'
+    '    echo finished everything'
+)
+
+NL_FILE = (
+    'def calculate(alpha, beta):\n'
+    '    first = alpha * 2\n'
+    '    second = beta * 3\n'
+    '    combined = first + second\n'
+    '    return combined\n'
+    '\n'
+    'def other():\n'
+    '    return 0\n'
+)
+OLD_NL = (
+    '  first = alpha * 2\n  second = beta * 3\n'
+    '  combined = first + second\n  return combined\n'
+)
+
+
+def _edit(tmp_path, monkeypatch, name, content, old, new):
+    monkeypatch.setenv('OH_FUZZY_STR_REPLACE', '1')
+    f = tmp_path / name
+    f.write_text(content)
+    FuzzyOHEditor(workspace_root=tmp_path).str_replace(f, old, new, False)
+    return f.read_text()
+
+
+def test_tab_indented_python_keeps_tabs(tmp_path, monkeypatch):
+    new = OLD_TAB.replace('self.store(enriched)', 'self.store(enriched, retry=True)')
+    after = _edit(tmp_path, monkeypatch, 'h.py', TAB_FILE, OLD_TAB, new)
+
+    compile(after, 'h.py', 'exec')  # 合成空格会在这里抛 TabError
+    assert '\t\tstored = self.store(enriched, retry=True)' in after
+    assert not any(ln.startswith('    ') for ln in after.splitlines())
+
+
+def test_tab_indented_python_nested_insert(tmp_path, monkeypatch):
+    new = OLD_TAB.replace(
+        '        return stored',
+        '        if stored:\n            log(stored)\n        return stored')
+    after = _edit(tmp_path, monkeypatch, 'h.py', TAB_FILE, OLD_TAB, new)
+
+    compile(after, 'h.py', 'exec')
+    assert '\t\tif stored:' in after
+    assert '\t\t\tlog(stored)' in after  # 深一级要按文件的缩进单位加, 不是空格
+
+
+def test_makefile_recipe_keeps_tabs(tmp_path, monkeypatch):
+    new = OLD_MK.replace('finished everything', 'all done')
+    after = _edit(tmp_path, monkeypatch, 'Makefile', MAKEFILE, OLD_MK, new)
+
+    recipes = [ln for ln in after.splitlines() if ln.strip().startswith('echo')]
+    assert recipes and all(ln.startswith('\t') for ln in recipes)
+    assert '\techo all done' in after
+
+
+def test_trailing_newline_boundary_preserved(tmp_path, monkeypatch):
+    new = OLD_NL.replace('beta * 3', 'beta * 4').rstrip('\n')  # 模型漏掉结尾换行
+    after = _edit(tmp_path, monkeypatch, 'c.py', NL_FILE, OLD_NL, new)
+
+    compile(after, 'c.py', 'exec')
+    assert '\n\ndef other():' in after  # 函数之间的空行不能被吃掉
+    assert len(after.splitlines()) == len(NL_FILE.splitlines())
+
+
 def test_guard_can_be_switched_off(workspace, monkeypatch):
     root, f = workspace
     monkeypatch.setenv('OH_FUZZY_SYNTAX_GUARD', '0')

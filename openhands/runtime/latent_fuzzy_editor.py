@@ -18,12 +18,16 @@
 
 命中之后有两道保护, 都是被真实故障逼出来的:
 
+  换行边界  替换文本的结尾换行与被替换窗口保持一致 —— 模型少写结尾换行会把下一行
+            接上来或吃掉一个空行, 多写则凭空插一个空行。
   缩进重排  模型的引用常常只有部分行丢了缩进(例如前两行 8 空格、后几行 4 空格),
             此时"恒定偏移"不成立。早先的实现在这种情况下直接把 new_str 原样写回,
             结果把方法体末尾几行移出了函数, 文件变成 'return' outside function
             —— 补丁看着命中、实际不可编译。现在改为: 用 difflib 在去首尾空白的
             行序列上对齐 old_str 与 new_str, 对齐上的行一律沿用**文件里那一行的
-            真实缩进**, 新增行按模型给的相对缩进锚定到最近的对齐行。
+            真实缩进**, 改动行/新增行以锚点的**字面**缩进为基准按相对层级增减
+            (制表符文件照抄制表符, 不再合成空格 —— 否则 Python 抛 TabError、
+            Makefile 直接静默改坏)。
   语法闸门  写回前对 .py 做一次 compile。编辑前能编译、编辑后不能, 就不写,
             按普通拒绝返回并附上语法错误 —— 把静默损坏变成一次可纠正的失败。
             OH_FUZZY_SYNTAX_GUARD=0 可关闭。
@@ -63,6 +67,19 @@ def _strip_lines(s: str) -> list[str]:
 
 def _indent_of(line: str) -> str:
     return line[: len(line) - len(line.lstrip())]
+
+
+def _indent_unit(lines: list[str]) -> str:
+    """从一组行里推断"一级缩进"的字面写法。
+
+    含制表符就用制表符(Makefile 之类靠制表符表达语义的文件必须照抄),
+    否则取最小的正缩进宽度, 都没有就退回 4 个空格。
+    """
+    indents = [_indent_of(ln) for ln in lines if ln.strip()]
+    if any('\t' in ind for ind in indents):
+        return '\t'
+    widths = sorted({len(ind) for ind in indents if ind})
+    return ' ' * widths[0] if widths else '    '
 
 
 def _reindent_to_window(window: str, old_str: str, new_str: str) -> str:
@@ -117,8 +134,22 @@ def _reindent_to_window(window: str, old_str: str, new_str: str) -> str:
         if anchor is None:
             out[j] = src
             continue
-        delta = len(_indent_of(out[anchor])) - len(_indent_of(n_lines[anchor]))
-        out[j] = ' ' * max(0, len(_indent_of(src)) + delta) + src.lstrip()
+        # 改动行/新增行: 以锚点在文件里的**字面**缩进为基准, 按模型给的相对层级增减。
+        # 早先这里合成空格(' ' * n), 在制表符缩进的文件里会造出制表符与空格混用
+        # —— Python 抛 TabError(被闸门拦下, 合法编辑失败), Makefile 则直接静默改坏。
+        base = _indent_of(out[anchor])
+        delta = len(_indent_of(src)) - len(_indent_of(n_lines[anchor]))
+        if delta == 0:
+            out[j] = base + src.lstrip()
+            continue
+        model_unit = max(1, len(_indent_unit(n_lines)))
+        file_unit = _indent_unit(w_lines)
+        levels = int(round(delta / model_unit))
+        if levels >= 0:
+            out[j] = base + file_unit * levels + src.lstrip()
+        else:
+            keep = max(0, len(base) + levels * len(file_unit))
+            out[j] = base[:keep] + src.lstrip()
 
     return '\n'.join(out) + ('\n' if new_str.endswith('\n') else '')
 
@@ -298,6 +329,12 @@ class FuzzyOHEditor(OHEditor):
 
         start, end = span
         replaced = file_content[start:end]
+        # 换行边界必须与被替换的窗口一致: 模型少写结尾换行会把下一行接上来
+        # (或吃掉一个空行), 多写则凭空插一个空行。
+        if replaced.endswith('\n') and not new_str.endswith('\n'):
+            new_str += '\n'
+        elif not replaced.endswith('\n') and new_str.endswith('\n'):
+            new_str = new_str[:-1]
         new_file_content = file_content[:start] + new_str + file_content[end:]
         self._guard_syntax(path, file_content, new_file_content)
         logger.info(
