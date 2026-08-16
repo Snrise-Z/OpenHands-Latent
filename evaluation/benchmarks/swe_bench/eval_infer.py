@@ -72,7 +72,11 @@ def process_git_patch(patch):
 
 def get_config(metadata: EvalMetadata, instance: pd.Series) -> OpenHandsConfig:
     # We use a different instance image for the each instance of swe-bench eval
-    base_container_image = get_instance_docker_image(instance['instance_id'])
+    # 判分与 rollout 用同一批官方镜像(sweb.eval.x86_64.<repo>_1776_<name>),
+    # 而不是 harness 自建的 _s_ 命名镜像 —— 本机只缓存了官方镜像。
+    base_container_image = get_instance_docker_image(
+        instance['instance_id'], swebench_official_image=True
+    )
     logger.info(
         f'Using instance container image: {base_container_image}. '
         f'Please make sure this image exists. '
@@ -283,6 +287,19 @@ def process_instance(
                 # Grade answer
                 if isinstance(cat_obs, CmdOutputObservation) and cat_obs.exit_code == 0:
                     test_output = cat_obs.content
+                    # CmdOutputObservation 会把内容截到 30000 字符(掐掉中段)。判分脚本
+                    # 前半段是 set -x 的 conda 激活跟踪,长实例会把 ">>>>> Start Test
+                    # Output" 标记挤进被掐掉的区间,于是 swebench 解析器判定"补丁未应用"、
+                    # 一律 resolved=False。这里绕过观察层,直接从容器根文件系统读全量日志。
+                    to_host = getattr(runtime, '_sandbox_to_host', None)
+                    if callable(to_host):
+                        try:
+                            with open(to_host(log_file), errors='replace') as _lf:
+                                test_output = _lf.read()
+                        except OSError as _e:
+                            logger.warning(
+                                f'[{instance_id}] 直接读取判分日志失败,回退到截断版本: {_e}'
+                            )
                     assert isinstance(test_output, str)
                     instance['test_result']['test_output'] = test_output
 

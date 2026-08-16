@@ -34,7 +34,10 @@ if [ -d /workspace/$WORKSPACE_NAME ]; then
     rm -rf /workspace/$WORKSPACE_NAME
 fi
 mkdir -p /workspace
-cp -r /testbed /workspace/$WORKSPACE_NAME
+# 用 tar 管道而不是 cp -r:udocker 的 F3(fakechroot)模式下 cp 会建出空目录后
+# stat 失败,导致仓库被复制成空壳、随后 git 命令报 "not a git repository"。
+mkdir -p /workspace/$WORKSPACE_NAME
+(cd /testbed && tar cf - .) | (cd /workspace/$WORKSPACE_NAME && tar xf -)
 
 # Activate instance-specific environment
 if [ -d /opt/miniconda3 ]; then

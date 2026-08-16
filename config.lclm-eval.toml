@@ -1,0 +1,152 @@
+[core]
+workspace_base = "/root/autodl-tmp/eval_v3s/workspace"
+save_trajectory_path = "/root/autodl-tmp/eval_v3s/trajectories"
+file_store = "local"
+file_store_path = "/root/autodl-tmp/eval_v3s/file_store"
+
+# 8 个推理副本(每卡一个),端口 8600-8607。分片绑副本,同一任务整段对话固定落在同一副本。
+# 采样口径与 Qwen3-4B 基线逐项一致:温度 0.7 / TopP 0.8 / TopK 20 / MinP 0(服务端亦固定),
+# 上下文 262144,输出上限 32768,原生工具调用,不开 prompt 缓存标记,超时 2400 秒(基线教训)。
+[llm.lclm0]
+model = "openai/qwen3-4b-2507"
+base_url = "http://127.0.0.1:8600/v1"
+api_key = "EMPTY"
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+max_input_tokens = 262144
+max_output_tokens = 32768
+native_tool_calling = true
+caching_prompt = false
+drop_params = true
+num_retries = 8
+retry_min_wait = 5
+retry_max_wait = 60
+timeout = 2400
+
+[llm.lclm1]
+model = "openai/qwen3-4b-2507"
+base_url = "http://127.0.0.1:8601/v1"
+api_key = "EMPTY"
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+max_input_tokens = 262144
+max_output_tokens = 32768
+native_tool_calling = true
+caching_prompt = false
+drop_params = true
+num_retries = 8
+retry_min_wait = 5
+retry_max_wait = 60
+timeout = 2400
+
+[llm.lclm2]
+model = "openai/qwen3-4b-2507"
+base_url = "http://127.0.0.1:8602/v1"
+api_key = "EMPTY"
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+max_input_tokens = 262144
+max_output_tokens = 32768
+native_tool_calling = true
+caching_prompt = false
+drop_params = true
+num_retries = 8
+retry_min_wait = 5
+retry_max_wait = 60
+timeout = 2400
+
+[llm.lclm3]
+model = "openai/qwen3-4b-2507"
+base_url = "http://127.0.0.1:8603/v1"
+api_key = "EMPTY"
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+max_input_tokens = 262144
+max_output_tokens = 32768
+native_tool_calling = true
+caching_prompt = false
+drop_params = true
+num_retries = 8
+retry_min_wait = 5
+retry_max_wait = 60
+timeout = 2400
+
+[llm.lclm4]
+model = "openai/qwen3-4b-2507"
+base_url = "http://127.0.0.1:8604/v1"
+api_key = "EMPTY"
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+max_input_tokens = 262144
+max_output_tokens = 32768
+native_tool_calling = true
+caching_prompt = false
+drop_params = true
+num_retries = 8
+retry_min_wait = 5
+retry_max_wait = 60
+timeout = 2400
+
+[llm.lclm5]
+model = "openai/qwen3-4b-2507"
+base_url = "http://127.0.0.1:8605/v1"
+api_key = "EMPTY"
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+max_input_tokens = 262144
+max_output_tokens = 32768
+native_tool_calling = true
+caching_prompt = false
+drop_params = true
+num_retries = 8
+retry_min_wait = 5
+retry_max_wait = 60
+timeout = 2400
+
+[llm.lclm6]
+model = "openai/qwen3-4b-2507"
+base_url = "http://127.0.0.1:8606/v1"
+api_key = "EMPTY"
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+max_input_tokens = 262144
+max_output_tokens = 32768
+native_tool_calling = true
+caching_prompt = false
+drop_params = true
+num_retries = 8
+retry_min_wait = 5
+retry_max_wait = 60
+timeout = 2400
+
+[llm.lclm7]
+model = "openai/qwen3-4b-2507"
+base_url = "http://127.0.0.1:8607/v1"
+api_key = "EMPTY"
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+max_input_tokens = 262144
+max_output_tokens = 32768
+native_tool_calling = true
+caching_prompt = false
+drop_params = true
+num_retries = 8
+retry_min_wait = 5
+retry_max_wait = 60
+timeout = 2400
+
+[agent]
+enable_browsing = false
+enable_jupyter = false
+enable_llm_editor = false
+
+[condenser]
+type = "noop"

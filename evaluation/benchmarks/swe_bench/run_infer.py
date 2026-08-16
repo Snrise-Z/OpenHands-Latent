@@ -860,7 +860,17 @@ if __name__ == '__main__':
 
     if not ITERATIVE_EVAL_MODE:
         # load the dataset
-        instances = prepare_dataset(swe_bench_tests, output_file, args.eval_n_limit)
+        # EVAL_IDS_FILE restricts this process to a fixed instance subset, so a
+        # shard can be pinned to one inference replica and keep its prefix cache.
+        _ids_file = os.environ.get('EVAL_IDS_FILE')
+        _eval_ids = None
+        if _ids_file:
+            with open(_ids_file) as _f:
+                _eval_ids = [ln.strip() for ln in _f if ln.strip()]
+            logger.info(f'EVAL_IDS_FILE={_ids_file}: {len(_eval_ids)} instances')
+        instances = prepare_dataset(
+            swe_bench_tests, output_file, args.eval_n_limit, eval_ids=_eval_ids
+        )
         if len(instances) > 0 and not isinstance(
             instances['PASS_TO_PASS'][instances['PASS_TO_PASS'].index[0]], str
         ):
