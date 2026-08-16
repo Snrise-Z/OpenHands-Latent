@@ -21,9 +21,12 @@ PYTHONPATH).
 
 from __future__ import annotations
 
+import fcntl
 import os
+import shutil
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 from openhands.core.logger import openhands_logger as logger
@@ -41,6 +44,13 @@ UDOCKER_REPOS = os.environ.get('UDOCKER_REPOS', f'{UDOCKER_STORE}/repos')
 UDOCKER_LAYERS = os.environ.get('UDOCKER_LAYERS', f'{UDOCKER_STORE}/layers')
 UDOCKER_CONTAINERS = os.environ.get('UDOCKER_CONTAINERS', f'{UDOCKER_DIR}/containers')
 UDOCKER_EXECMODE = os.environ.get('UDOCKER_EXECMODE', 'F3')
+# Container templates: extract (create + setup) each image ONCE into
+# UDOCKER_TEMPLATE_DIR/<image>/src, then clone per task with `cp -a
+# --reflink` (XFS/btrfs reflink: metadata-only, no data copy). Container
+# creation is otherwise a 2.5 GB write per task, which saturates the local
+# RAID with 60+ concurrent tasks (18 % iowait, 15-20 min startup stalls).
+# Must live on the same filesystem as UDOCKER_CONTAINERS. Empty = disabled.
+UDOCKER_TEMPLATE_DIR = os.environ.get('UDOCKER_TEMPLATE_DIR', '')
 # proot (P1/P2 fallbacks and some udocker internals) requires an
 # exec-permitted temp dir; the default /dev/shm mount here is noexec.
 UDOCKER_TMP = os.environ.get('UDOCKER_TMP', '/root/autodl-tmp/.proot-tmp')
@@ -76,6 +86,71 @@ def _udocker(*args: str, timeout: int = 3600) -> subprocess.CompletedProcess:
         [UDOCKER_EXE, '--allow-root', *args],
         capture_output=True, text=True, timeout=timeout, env=_udocker_env(),
     )
+
+
+def _template_key(image_ref: str) -> str:
+    return image_ref.replace('/', '__').replace(':', '__')
+
+
+def _ensure_template(image_ref: str) -> Path | None:
+    """Return the template dir for image_ref (building it under a lock if
+    needed), or None if templates are disabled / build failed."""
+    if not UDOCKER_TEMPLATE_DIR:
+        return None
+    base = Path(UDOCKER_TEMPLATE_DIR)
+    base.mkdir(parents=True, exist_ok=True)
+    tdir = base / _template_key(image_ref)
+    ready = tdir / '.ready'
+    if ready.exists() and (tdir / 'src' / 'ROOT').exists():
+        return tdir
+    lock_path = base / f'.{_template_key(image_ref)}.lock'
+    with open(lock_path, 'w') as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            if ready.exists() and (tdir / 'src' / 'ROOT').exists():
+                return tdir
+            tname = f'tmpl_{uuid.uuid4().hex[:12]}'
+            out = _udocker('create', f'--name={tname}', image_ref)
+            if out.returncode != 0 or 'Error' in out.stderr:
+                logger.warning(f'[udocker] template create failed for {image_ref}: {out.stderr[-200:]}')
+                return None
+            st = _udocker('setup', '--force', f'--execmode={UDOCKER_EXECMODE}', tname)
+            link = Path(UDOCKER_CONTAINERS) / tname
+            cid_dir = link.resolve() if link.is_symlink() else link
+            if not (cid_dir / 'ROOT').exists():
+                logger.warning(f'[udocker] template rootfs missing for {image_ref}: {st.stderr[-200:]}')
+                return None
+            if tdir.exists():
+                shutil.rmtree(tdir, ignore_errors=True)
+            tdir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(cid_dir), str(tdir / 'src'))     # same filesystem: rename
+            if link.is_symlink():
+                link.unlink()
+            ready.write_text(image_ref)
+            logger.info(f'[udocker] built template for {image_ref} at {tdir}')
+            return tdir
+        except Exception as e:
+            logger.warning(f'[udocker] template build error for {image_ref}: {e}')
+            return None
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def _clone_from_template(tdir: Path, name: str) -> bool:
+    """cp -a --reflink the template into a fresh container id and register the name symlink."""
+    new_id = str(uuid.uuid4())
+    dst = Path(UDOCKER_CONTAINERS) / new_id
+    r = subprocess.run(['cp', '-a', '--reflink=always', str(tdir / 'src'), str(dst)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        shutil.rmtree(dst, ignore_errors=True)
+        logger.warning(f'[udocker] reflink clone failed: {r.stderr[-200:]}')
+        return False
+    link = Path(UDOCKER_CONTAINERS) / name
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(new_id)   # udocker convention: containers/<name> -> <id> (relative)
+    return True
 
 
 class UDockerRuntime(CLIRuntime):
@@ -126,7 +201,13 @@ class UDockerRuntime(CLIRuntime):
         self._pull_if_missing(image_ref)
         ps = _udocker('ps')
         if self._container_name not in ps.stdout:
-            out = _udocker('create', f'--name={self._container_name}', image_ref)
+            tdir = _ensure_template(image_ref)
+            cloned = bool(tdir) and _clone_from_template(tdir, self._container_name)
+            if cloned:
+                logger.info(f'[udocker] cloned container {self._container_name} from template (reflink)')
+                out = subprocess.CompletedProcess(args=[], returncode=0, stdout='', stderr='')
+            else:
+                out = _udocker('create', f'--name={self._container_name}', image_ref)
             if out.returncode != 0 or 'Error' in out.stderr:
                 logger.warning(f'[udocker] create failed for {image_ref}, '
                                f're-pulling: {out.stderr[-200:]}')
