@@ -25,6 +25,9 @@ class LongCodeZipCompressor(Compressor):
     def __init__(self) -> None:
         self.url = os.environ.get('LONGCODEZIP_URL', 'http://127.0.0.1:8701/prune')
         self.rate = float(os.environ.get('LONGCODEZIP_RATE', '0.5') or 0.5)
+        # 只跑粗粒度阶段(原论文两阶段里的第一阶段)。在智能体观察上,
+        # 两阶段的排序模型开销高达观察本身的 160 倍,粗粒度则几乎不压缩,两者都要能选。
+        self.rank_only = os.environ.get('LONGCODEZIP_RANK_ONLY', '1').strip().lower() in ('1', 'true', 'yes')
         self.timeout = float(os.environ.get('OBS_HTTP_TIMEOUT', '300') or 300)
         self.retries = int(os.environ.get('OBS_HTTP_RETRIES', '2') or 2)
 
@@ -32,7 +35,8 @@ class LongCodeZipCompressor(Compressor):
         t0 = time.time()
         origin = count_tokens(text)
         query = (ctx.focus_question or '').strip() or derived_query(ctx)
-        payload = json.dumps({'query': query, 'code': text, 'rate': self.rate}).encode()
+        payload = json.dumps({'query': query, 'code': text, 'rate': self.rate,
+                              'rank_only': self.rank_only}).encode()
         last_err = None
         for attempt in range(self.retries + 1):
             try:
@@ -56,6 +60,7 @@ class LongCodeZipCompressor(Compressor):
                         'ranker_origin_tokens': d.get('origin_token_cnt'),
                         'ranker_left_tokens': d.get('left_token_cnt'),
                         'selected_chunks': d.get('selected_chunks'),
+                        'rank_only': self.rank_only,
                         'attempt': attempt,
                     },
                 )
