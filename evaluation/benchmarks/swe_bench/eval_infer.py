@@ -252,7 +252,8 @@ def process_instance(
 
                 # Poll for completion
                 start_time = time.time()
-                timeout = 1800  # 30 minutes
+                # 缺省 30 分钟;重判慢测试套件时用 SWEBENCH_EVAL_TIMEOUT 放宽
+                timeout = int(os.environ.get('SWEBENCH_EVAL_TIMEOUT', '1800'))
                 while True:
                     seconds_elapsed = time.time() - start_time
                     if seconds_elapsed > timeout:
