@@ -304,6 +304,14 @@ def response_to_actions(
                     arguments=arguments,
                 )
             else:
+                # 已知混淆(编辑器子命令/shell 命令被当独立工具)给带示例的定向提示;
+                # 只改写错误消息,不转译调用 —— 只提示不代做。
+                from openhands.core.guards import alias_hint, guard_record
+
+                _hint = alias_hint(tool_call.function.name, arguments)
+                if _hint:
+                    guard_record('tool-alias-hint', tool=tool_call.function.name)
+                    raise FunctionCallNotExistsError(_hint)
                 raise FunctionCallNotExistsError(
                     f'Tool {tool_call.function.name} is not registered. (arguments: {arguments}). Please check the tool name and retry with an existing tool.'
                 )

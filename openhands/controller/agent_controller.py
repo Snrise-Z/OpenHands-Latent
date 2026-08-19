@@ -520,6 +520,24 @@ class AgentController:
             return
 
         elif isinstance(action, AgentFinishAction):
+            # 空改动拦截:历史里没有任何"像是改了文件"的成功动作时,第一次 finish
+            # 退回一条说明(一次重试语义,第二次放行)。SWE-bench 里空改动永远不是
+            # 正确答案,拦截条件客观;治的是"零编辑却宣称已修复"的虚报(普查 73 条)。
+            from openhands.core.guards import (
+                FINISH_GATE_MSG,
+                finish_gate_should_block,
+                guard_record,
+            )
+
+            if finish_gate_should_block(
+                self.state.history, getattr(self, '_finish_gate_fired', False)
+            ):
+                self._finish_gate_fired = True
+                guard_record('finish-gate-blocked')
+                self.event_stream.add_event(
+                    MessageAction(content=FINISH_GATE_MSG), EventSource.USER
+                )
+                return
             self.state.outputs = action.outputs
             await self.set_agent_state_to(AgentState.FINISHED)
         elif isinstance(action, AgentRejectAction):

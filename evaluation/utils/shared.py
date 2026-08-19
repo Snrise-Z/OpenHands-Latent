@@ -123,6 +123,14 @@ def codeact_user_response(
         'IMPORTANT: YOU SHOULD NEVER ASK FOR HUMAN HELP.\n'
     )
 
+    # 掉出工具通道的催动:末尾连续纯文本消息时,把"请继续"升级成"必须调用工具"。
+    # 压缩臂的纯文本掉出是明文臂的 4 倍,卡循环第二大循环体由此而来。
+    from openhands.core.guards import channel_nudge
+
+    _nudge = channel_nudge(getattr(state, 'history', None))
+    if _nudge:
+        msg = _nudge + '\n' + msg
+
     if state.history:
         # check if the last action has an answer, if so, early exit
         if try_parse is not None:
