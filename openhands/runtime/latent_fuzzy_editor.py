@@ -1,47 +1,41 @@
-"""str_replace 的分层模糊匹配编辑器。
+"""str_replace 的模糊匹配:空白归一化唯一命中才自动改,其余只提示。
 
-上游 OHEditor.str_replace 要求 old_str 逐字唯一出现(含一次去首尾空白重试)。
-实测(LCLM 仓库 adapter_realign/v1_lastk2_failure_modes.md 的 22 次真实被拒):
-被拒引用与文件真实内容的归一化编辑距离全部 <= 12.3%, 而最优窗口与"不相交次优
-窗口"的距离间隔全部 >= 41%——即失败几乎都是缩进丢失/整块重构, 且正确位置在
-编辑距离意义下唯一得毫无悬念。
+上游 OHEditor.str_replace 要求 old_str 逐字唯一出现。500 题 x 7 策略主实验实测
+9140 次 str_replace 里 82% 被拒,其中 93% 是 old_str 逐字没匹配上;对 250 条真实
+失败样本的标定:最像候选 94% 指向正确位置、6% 指错。提示指错的代价是线性的
+(模型多试一轮),自动改错的代价是破坏性的(静默写进错误位置,而智能体只有 3% 的
+轨迹跑过测试,发现不了)。据此定策:
 
-本模块在上游精确匹配失败("did not appear verbatim")后追加两层回退:
+  自动层  仅当 old_str 与文件某个连续行窗口在逐行去首尾空白后完全一致、且该窗口
+          在文件中唯一(纯缩进/行尾差异)。写回前有三道保护:
+            换行边界  替换文本的结尾换行与被替换窗口保持一致;
+            缩进重排  对齐行沿用文件真实缩进,改动/新增行按锚点字面缩进增减
+                      (制表符文件照抄制表符);
+            语法闸门  .py 编辑前能编译、编辑后不能就不写(OH_FUZZY_SYNTAX_GUARD=0 关)。
+          成功消息带 [fuzzy-auto] 标记并回显被替换的原文。
 
-  第二层  行级空白归一化: 按"逐行去首尾空白后的行序列"在文件中找唯一的连续
-          行窗口。
-  第三层  半全局编辑距离(Sellers 动态规划, O(|P|*|T|), numpy 向量化):
-          接受条件 = 归一化距离 <= FUZZY_MAX_DISTANCE(缺省 0.15)
-          且不相交次优间隔 >= FUZZY_MIN_MARGIN(缺省 0.05)。
-          间隔门是唯一性的操作化判据: 代码自相似导致的多候选会在这里被拒,
-          并把候选行号列表返回给模型(比"逐字不匹配"可操作得多)。
+  提示层  其余一律不改文件,只在拒绝消息里给可操作的提示(带 [fuzzy-hint] 标记):
+            唯一的相近候选      回显候选原文(带行号)+ 与 old_str 的逐行差异;
+            多个难分候选        只给各候选行号,不给内容,避免二选一指错;
+            找不到相近内容      提示重新查看文件 —— 引用的内容可能根本不在文件里。
+          相近判据:半全局编辑距离(Sellers 动态规划) <= FUZZY_MAX_DISTANCE(缺省
+          0.40,约相当于相似度 0.60);歧义判据:不相交次优与最优差 < FUZZY_MIN_MARGIN
+          (缺省 0.05)。
 
-命中之后有两道保护, 都是被真实故障逼出来的:
+  记录    每次决策(auto / hint-* / guard-blocked)都打一条 [fuzzy-editor] 日志;
+          设 OH_FUZZY_LOG=<路径> 时另落一行 JSONL,事后可逐臂统计。
+          这一条是被"兜底静默缺席"逼出来的:此前模糊层只接在 action_execution_server
+          (Docker 运行时)上,CLIRuntime/UDockerRuntime 路径一直走上游裸 OHEditor,
+          9140 次尝试没有任何日志能看出兜底不在场。
 
-  换行边界  替换文本的结尾换行与被替换窗口保持一致 —— 模型少写结尾换行会把下一行
-            接上来或吃掉一个空行, 多写则凭空插一个空行。
-  缩进重排  模型的引用常常只有部分行丢了缩进(例如前两行 8 空格、后几行 4 空格),
-            此时"恒定偏移"不成立。早先的实现在这种情况下直接把 new_str 原样写回,
-            结果把方法体末尾几行移出了函数, 文件变成 'return' outside function
-            —— 补丁看着命中、实际不可编译。现在改为: 用 difflib 在去首尾空白的
-            行序列上对齐 old_str 与 new_str, 对齐上的行一律沿用**文件里那一行的
-            真实缩进**, 改动行/新增行以锚点的**字面**缩进为基准按相对层级增减
-            (制表符文件照抄制表符, 不再合成空格 —— 否则 Python 抛 TabError、
-            Makefile 直接静默改坏)。
-  语法闸门  写回前对 .py 做一次 compile。编辑前能编译、编辑后不能, 就不写,
-            按普通拒绝返回并附上语法错误 —— 把静默损坏变成一次可纠正的失败。
-            OH_FUZZY_SYNTAX_GUARD=0 可关闭。
-
-安全边界: 过短模式(有效字符 < 40)不进入回退层; 非精确层的成功消息中回显
-实际被替换的原文, 模型可自查; "Multiple occurrences" 类错误(歧义)原样透传,
-不做模糊消解。环境变量 OH_FUZZY_STR_REPLACE=0 整体关闭, 行为回到上游。
-每次回退层命中都会打一条 [fuzzy-editor] 日志 —— 否则事后无法从轨迹里统计
-到底触发了几次(这正是八组矩阵复盘时踩到的观测缺口)。
+环境变量 OH_FUZZY_STR_REPLACE=0 整体关闭,行为回到上游。
 """
 
 import difflib
+import json
 import os
 import re
+import time
 from pathlib import Path
 
 from openhands.core.logger import openhands_logger as logger
@@ -154,6 +148,25 @@ def _reindent_to_window(window: str, old_str: str, new_str: str) -> str:
     return '\n'.join(out) + ('\n' if new_str.endswith('\n') else '')
 
 
+def _record(event: str, path='', **fields) -> None:
+    """每次模糊层决策都记录:logger 一条,OH_FUZZY_LOG 设了再落一行 JSONL。
+
+    任何异常都吞掉 —— 记录失败不能影响编辑本身。
+    """
+    rec = {'ts': round(time.time(), 3), 'event': event, 'path': str(path), **fields}
+    try:
+        logger.info('[fuzzy-editor] ' + json.dumps(rec, ensure_ascii=False))
+    except Exception:
+        pass
+    log_path = os.environ.get('OH_FUZZY_LOG', '').strip()
+    if log_path:
+        try:
+            with open(log_path, 'a') as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+
+
 class FuzzyOHEditor(OHEditor):
     """精确优先、失败后分层回退的 str_replace。"""
 
@@ -171,8 +184,6 @@ class FuzzyOHEditor(OHEditor):
             if 'did not appear verbatim' not in str(err):
                 raise  # 歧义等其他错误原样透传
             if os.environ.get('OH_FUZZY_STR_REPLACE', '1') == '0':
-                raise
-            if _substantive_len(old_str) < _MIN_PATTERN_CHARS:
                 raise
             result = self._fuzzy_str_replace(
                 path, old_str, new_str or '', enable_linting, err
@@ -235,7 +246,9 @@ class FuzzyOHEditor(OHEditor):
         """唯一(带间隔门)的最小编辑距离窗口 -> (start_idx, end_idx, d1, |P|)."""
         if _np is None:
             return None
-        tau = float(os.environ.get('FUZZY_MAX_DISTANCE', '0.15') or 0.15)
+        # 只用于提示层的接受门(自动层不经过这里); 0.40 约相当于相似度 0.60,
+        # 低于它的候选连提示价值都没有(250 条真实失败标定里 16% 落在这一档)。
+        tau = float(os.environ.get('FUZZY_MAX_DISTANCE', '0.40') or 0.40)
         min_margin = float(os.environ.get('FUZZY_MIN_MARGIN', '0.05') or 0.05)
         pb = old_str.encode('utf-8', 'ignore')
         tb = file_content.encode('utf-8', 'ignore')
@@ -288,46 +301,88 @@ class FuzzyOHEditor(OHEditor):
                 f'appears in the file, keeping the original indentation.'
             )
 
-    # -------------------------------------------------------------- 施加
+    # -------------------------------------------------------------- 决策
     def _fuzzy_str_replace(self, path, old_str, new_str, enable_linting, orig_err):
         file_content = self.read_file(path)
 
-        note = None
-        span = None
-        tier = None
+        # ---- 自动层: 空白归一化后逐行完全一致且窗口唯一(纯缩进/行尾差异) ----
         m2 = self._match_normalized_lines(file_content, old_str)
         if isinstance(m2, tuple) and m2 and m2[0] == 'AMBIGUOUS':
+            lines = [h + 1 for h in m2[1]]
+            _record('hint-ambiguous-normalized', path, candidate_line_starts=lines)
             raise ToolError(
-                f'No replacement was performed. old_str did not appear verbatim, and '
-                f'whitespace-normalized matching found multiple candidate windows at '
-                f'line starts {[h + 1 for h in m2[1]]} in {path}. Please disambiguate.'
+                f'No replacement was performed. old_str did not appear verbatim in '
+                f'{path}. [fuzzy-hint] Whitespace-normalized matching found multiple '
+                f'candidate windows starting at lines {lines}. Quote more surrounding '
+                f'context to make old_str unique. No changes were made.'
             )
         if m2 is not None:
-            start, end, delta = m2
-            tier = 'normalized-lines'
-            new_str = _reindent_to_window(file_content[start:end], old_str, new_str)
-            span = (start, end)
-            note = (
-                '[fuzzy-match: whitespace-normalized line match, new_str re-indented '
-                'to the file]'
+            return self._auto_apply(
+                path, file_content, m2, old_str, new_str, enable_linting
             )
-        else:
-            m3 = self._match_edit_distance(file_content, old_str)
-            if isinstance(m3, tuple) and m3 and m3[0] == 'AMBIGUOUS':
-                raise ToolError(
-                    f'No replacement was performed. old_str did not appear verbatim, '
-                    f'and edit-distance matching found multiple similar windows near '
-                    f'lines {m3[1]} in {path}. Please quote more context to disambiguate.'
-                )
-            if m3 is None:
-                return None
-            start, end, d1, plen = m3
-            tier = 'edit-distance'
-            new_str = _reindent_to_window(file_content[start:end], old_str, new_str)
-            span = (start, end)
-            note = f'[fuzzy-match: edit-distance window, distance {d1}/{plen} chars]'
 
-        start, end = span
+        # ---- 提示层: 一律不改文件, 只描述最接近的候选 ----
+        if _substantive_len(old_str) < _MIN_PATTERN_CHARS:
+            _record('hint-none-short', path,
+                    substantive_chars=_substantive_len(old_str))
+            raise ToolError(
+                str(orig_err)
+                + ' [fuzzy-hint] The quoted old_str is very short and has no '
+                'whitespace-equivalent match in the file; view the file again and '
+                'quote the target text exactly as it appears, with more surrounding '
+                'context. No changes were made.'
+            )
+        m3 = self._match_edit_distance(file_content, old_str)
+        if isinstance(m3, tuple) and m3 and m3[0] == 'AMBIGUOUS':
+            _record('hint-ambiguous-distance', path, candidate_lines=m3[1])
+            raise ToolError(
+                f'No replacement was performed. old_str did not appear verbatim in '
+                f'{path}. [fuzzy-hint] Multiple similarly-close regions exist near '
+                f'lines {m3[1]}; quote more surrounding context to disambiguate. '
+                f'No changes were made.'
+            )
+        if m3 is None:
+            _record('hint-none', path)
+            raise ToolError(
+                str(orig_err)
+                + ' [fuzzy-hint] No sufficiently similar text was found anywhere in '
+                'this file - the quoted old_str may be remembered rather than read. '
+                'View the file again before editing. No changes were made.'
+            )
+        start, end, d1, plen = m3
+        # 候选扩到整行再回显, 半行开头的提示没法照抄
+        disp_start = file_content.rfind('\n', 0, start) + 1
+        disp_end = file_content.find('\n', end)
+        disp_end = len(file_content) if disp_end == -1 else disp_end
+        candidate = file_content[disp_start:disp_end]
+        first_line = file_content.count('\n', 0, disp_start) + 1
+        shown = candidate if len(candidate) <= 1500 else candidate[:1500] + '…'
+        numbered = '\n'.join(
+            f'{first_line + i:6d}\t{ln}' for i, ln in enumerate(shown.splitlines())
+        )
+        diff_lines = list(difflib.unified_diff(
+            old_str.splitlines(), candidate.splitlines(),
+            fromfile='your old_str', tofile=f'{path} (actual)', lineterm='', n=1,
+        ))
+        diff = '\n'.join(diff_lines[:60])
+        _record('hint-candidate', path, distance_chars=d1, pattern_chars=plen,
+                first_line=first_line,
+                last_line=first_line + candidate.count('\n'))
+        raise ToolError(
+            f'No replacement was performed. old_str did not appear verbatim in '
+            f'{path}. [fuzzy-hint] The closest region (edit distance {d1}/{plen} '
+            f'chars) is:\n{numbered}\n'
+            f'Differences between your old_str (-) and the actual file text (+):\n'
+            f'{diff}\n'
+            f'If this is the region you intended to edit, re-issue str_replace '
+            f'quoting the actual file text above verbatim (keep its exact '
+            f'indentation). No changes were made.'
+        )
+
+    # -------------------------------------------------------------- 自动层施加
+    def _auto_apply(self, path, file_content, m2, old_str, new_str, enable_linting):
+        start, end, delta = m2
+        new_str = _reindent_to_window(file_content[start:end], old_str, new_str)
         replaced = file_content[start:end]
         # 换行边界必须与被替换的窗口一致: 模型少写结尾换行会把下一行接上来
         # (或吃掉一个空行), 多写则凭空插一个空行。
@@ -336,26 +391,31 @@ class FuzzyOHEditor(OHEditor):
         elif not replaced.endswith('\n') and new_str.endswith('\n'):
             new_str = new_str[:-1]
         new_file_content = file_content[:start] + new_str + file_content[end:]
-        self._guard_syntax(path, file_content, new_file_content)
-        logger.info(
-            f'[fuzzy-editor] tier={tier} path={path} '
-            f'replaced_lines={replaced.count(chr(10)) + 1} note={note}'
-        )
+        first_line = file_content.count('\n', 0, start) + 1
+        try:
+            self._guard_syntax(path, file_content, new_file_content)
+        except ToolError:
+            _record('guard-blocked', path, first_line=first_line)
+            raise
+        _record('auto', path, first_line=first_line,
+                replaced_lines=replaced.count('\n') + 1,
+                uniform_indent_shift=delta)
         self.write_file(path, new_file_content)
         self._history_manager.add_history(path, file_content)
 
-        replacement_line = file_content.count('\n', 0, start) + 1
         from openhands_aci.editor.config import SNIPPET_CONTEXT_WINDOW
 
-        start_line = max(0, replacement_line - SNIPPET_CONTEXT_WINDOW)
-        end_line = replacement_line + SNIPPET_CONTEXT_WINDOW + new_str.count('\n')
+        start_line = max(0, first_line - SNIPPET_CONTEXT_WINDOW)
+        end_line = first_line + SNIPPET_CONTEXT_WINDOW + new_str.count('\n')
         snippet = self.read_file(path, start_line=start_line + 1, end_line=end_line)
 
         shown = replaced if len(replaced) <= 800 else replaced[:800] + '…'
         success_message = (
-            f'The file {path} has been edited. {note}\n'
-            f'Note: old_str did not match verbatim; the following actual file text was '
-            f'replaced (verify it is what you intended):\n---\n{shown}\n---\n'
+            f'The file {path} has been edited. [fuzzy-auto] old_str matched after '
+            f'whitespace normalization only (pure indentation/line-ending '
+            f'difference, unique in file); new_str was re-indented to the file.\n'
+            f'The following actual file text was replaced (verify it is what you '
+            f'intended):\n---\n{shown}\n---\n'
         )
         success_message += self._make_output(
             snippet, f'a snippet of {path}', start_line + 1

@@ -152,7 +152,23 @@ class CLIRuntime(Runtime):
 
         # Initialize runtime state
         self._runtime_initialized = False
-        self.file_editor = OHEditor(workspace_root=self._workspace_path)
+        # str_replace 编辑器带模糊层: 空白归一化唯一命中才自动改, 其余只提示。
+        # 早先这个开关只接在 action_execution_server(Docker 运行时)上, CLIRuntime
+        # 路径一直走上游裸 OHEditor, 兜底静默缺席了一整轮评测 —— 必须与其同一开关,
+        # 并把实际生效的编辑器类记进日志, 否则事后无法核对兜底在不在场。
+        if os.environ.get('OH_FUZZY_STR_REPLACE', '1') != '0':
+            from openhands.runtime.latent_fuzzy_editor import FuzzyOHEditor
+
+            self.file_editor: OHEditor = FuzzyOHEditor(
+                workspace_root=self._workspace_path
+            )
+        else:
+            self.file_editor = OHEditor(workspace_root=self._workspace_path)
+        logger.info(
+            f'[fuzzy-editor] effective file editor: '
+            f'{type(self.file_editor).__name__} '
+            f"(OH_FUZZY_STR_REPLACE={os.environ.get('OH_FUZZY_STR_REPLACE', '1')})"
+        )
         self._shell_stream_callback: Callable[[str], None] | None = None
 
         # Initialize PowerShell session on Windows

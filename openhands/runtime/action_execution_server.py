@@ -196,6 +196,11 @@ class ActionExecutor:
             self.file_editor: OHEditor = FuzzyOHEditor(workspace_root=self._initial_cwd)
         else:
             self.file_editor = OHEditor(workspace_root=self._initial_cwd)
+        logger.info(
+            f'[fuzzy-editor] effective file editor: '
+            f'{type(self.file_editor).__name__} '
+            f"(OH_FUZZY_STR_REPLACE={os.environ.get('OH_FUZZY_STR_REPLACE', '1')})"
+        )
         self.enable_browser = enable_browser
         self.browser: BrowserEnv | None = None
         self.browser_init_task: asyncio.Task | None = None
