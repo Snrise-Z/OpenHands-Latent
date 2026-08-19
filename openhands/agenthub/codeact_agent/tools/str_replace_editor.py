@@ -8,6 +8,7 @@ from openhands.agenthub.codeact_agent.tools.security_utils import (
 )
 from openhands.core.config.config_utils import DEFAULT_WORKSPACE_MOUNT_PATH_IN_SANDBOX
 from openhands.llm.tool_names import STR_REPLACE_EDITOR_TOOL_NAME
+from openhands.memory.obs_compress.tool_schema import maybe_add_focus_question
 
 _DETAILED_STR_REPLACE_EDITOR_DESCRIPTION = """Custom editing tool for viewing, creating and editing files in plain-text format
 * State is persistent across command calls and discussions with the user
@@ -105,7 +106,7 @@ def create_str_replace_editor_tool(
         if use_short_description
         else _DETAILED_STR_REPLACE_EDITOR_DESCRIPTION
     )
-    return ChatCompletionToolParam(
+    return maybe_add_focus_question(ChatCompletionToolParam(
         type='function',
         function=ChatCompletionToolParamFunctionChunk(
             name=STR_REPLACE_EDITOR_TOOL_NAME,
@@ -159,3 +160,4 @@ def create_str_replace_editor_tool(
             },
         ),
     )
+)

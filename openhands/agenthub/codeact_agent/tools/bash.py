@@ -6,6 +6,7 @@ from openhands.agenthub.codeact_agent.tools.security_utils import (
     SECURITY_RISK_DESC,
 )
 from openhands.llm.tool_names import EXECUTE_BASH_TOOL_NAME
+from openhands.memory.obs_compress.tool_schema import maybe_add_focus_question
 
 _DETAILED_BASH_DESCRIPTION = """Execute a bash command in the terminal within a persistent shell session.
 
@@ -45,7 +46,7 @@ def create_cmd_run_tool(
     description = (
         _SHORT_BASH_DESCRIPTION if use_short_description else _DETAILED_BASH_DESCRIPTION
     )
-    return ChatCompletionToolParam(
+    return maybe_add_focus_question(ChatCompletionToolParam(
         type='function',
         function=ChatCompletionToolParamFunctionChunk(
             name=EXECUTE_BASH_TOOL_NAME,
@@ -80,3 +81,4 @@ def create_cmd_run_tool(
             },
         ),
     )
+)

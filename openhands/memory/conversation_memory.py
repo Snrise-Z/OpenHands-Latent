@@ -5,6 +5,7 @@ from litellm import ModelResponse
 from openhands.core.config.agent_config import AgentConfig
 from openhands.core.logger import openhands_logger as logger
 from openhands.core.message import ImageContent, Message, TextContent
+from openhands.memory.obs_compress import apply_observation_compression
 from openhands.memory.latent_observation_policy import (
     apply_latent_observation_policy,
 )
@@ -167,6 +168,9 @@ class ConversationMemory:
 
         # Latent observation channel policy (no-op unless LATENT_OBS_POLICY is set)
         messages = apply_latent_observation_policy(messages)
+
+        # Baseline observation compression (no-op unless OBS_COMPRESS is set)
+        messages = apply_observation_compression(messages)
 
         return messages
 
