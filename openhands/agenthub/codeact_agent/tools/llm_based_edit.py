@@ -149,7 +149,7 @@ LLMBasedFileEditTool = ChatCompletionToolParam(
                     'enum': RISK_LEVELS,
                 },
             },
-            'required': ['path', 'content', 'security_risk'],
+            'required': ['path', 'content'],
         },
     ),
 )
