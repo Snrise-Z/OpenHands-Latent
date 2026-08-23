@@ -46,6 +46,8 @@ from openhands.runtime.plugins import (
 from openhands.utils.prompt import PromptManager
 
 
+from openhands.llm import swemaster_format as _swemaster
+
 class CodeActAgent(Agent):
     VERSION = '2.2'
     """
@@ -150,6 +152,17 @@ class CodeActAgent(Agent):
                     runtime_type=self.config.runtime,
                 )
             )
+        if _swemaster.enabled():
+            # SWE-Master 模式:训练协议只有 execute_bash / str_replace_editor /
+            # finish(对应训练的 submit)。think 与 task_tracker 是 OpenHands 侧的
+            # 结构化工具,训练时不存在 —— 模型的思考以 <think> 文本出现在正文里,
+            # 不走工具通道,故从工具列表中移除。
+            _sm_drop = {'think', 'task_tracker'}
+            tools = [
+                t
+                for t in tools
+                if t.get('function', {}).get('name') not in _sm_drop
+            ]
         return tools
 
     def reset(self) -> None:
