@@ -27,6 +27,8 @@ from openhands.llm.tool_names import (
 )
 
 # Inspired by: https://docs.together.ai/docs/llama-3-function-calling#function-calling-w-llama-31-70b
+from openhands.llm import swemaster_format as _swemaster
+
 SYSTEM_PROMPT_SUFFIX_TEMPLATE = """
 You have access to the following functions:
 
@@ -490,6 +492,7 @@ def convert_fncall_messages_to_non_fncall_messages(
 
     converted_messages = []
     first_user_message_encountered = False
+    n_assistant_seen = 0
     for message in messages:
         role = message['role']
         content = message['content']
@@ -497,6 +500,12 @@ def convert_fncall_messages_to_non_fncall_messages(
         # 1. SYSTEM MESSAGES
         # append system prompt suffix to content
         if role == 'system':
+            if _swemaster.enabled():
+                # SWE-Master 模式:整条系统消息替换为训练用提示(含手写工具块)
+                converted_messages.append(
+                    {'role': 'system', 'content': _swemaster.SYSTEM_PROMPT}
+                )
+                continue
             if isinstance(content, str):
                 content += system_prompt_suffix
             elif isinstance(content, list):
@@ -513,7 +522,11 @@ def convert_fncall_messages_to_non_fncall_messages(
         # 2. USER MESSAGES (no change)
         elif role == 'user':
             # Add in-context learning example for the first user message
-            if not first_user_message_encountered and add_in_context_learning_example:
+            if (
+                not first_user_message_encountered
+                and add_in_context_learning_example
+                and not _swemaster.enabled()
+            ):
                 first_user_message_encountered = True
 
                 # Generate example based on available tools
@@ -562,6 +575,7 @@ def convert_fncall_messages_to_non_fncall_messages(
         # - 3.1 no change if no function call
         # - 3.2 change if function call
         elif role == 'assistant':
+            n_assistant_seen += 1
             if 'tool_calls' in message and message['tool_calls'] is not None:
                 if len(message['tool_calls']) != 1:
                     raise FunctionCallConversionError(
@@ -592,6 +606,17 @@ def convert_fncall_messages_to_non_fncall_messages(
         elif role == 'tool':
             # Convert tool result as user message
             tool_name = message.get('name', 'function')
+            if _swemaster.enabled() and isinstance(content, str):
+                # SWE-Master 模式:观察按训练格式包裹(tool_response + 步数行)
+                converted_messages.append(
+                    {
+                        'role': 'user',
+                        'content': _swemaster.wrap_observation(
+                            tool_name, content, n_assistant_seen
+                        ),
+                    }
+                )
+                continue
             prefix = f'EXECUTION RESULT of [{tool_name}]:\n'
             # and omit "tool_call_id" AND "name"
             if isinstance(content, str):
@@ -872,6 +897,14 @@ def convert_non_fncall_messages_to_fncall_messages(
             if fn_match:
                 fn_name = fn_match.group(1)
                 fn_body = _normalize_parameter_tags(fn_match.group(2))
+                if _swemaster.enabled() and fn_name == 'submit':
+                    # SWE-Master 训练协议的结束工具叫 submit(无参数),
+                    # 映射为 OpenHands 的 finish 并补上必填的 message
+                    fn_name = 'finish'
+                    fn_body = (
+                        '<parameter=message>Task completed and submitted.'
+                        '</parameter>\n' + fn_body
+                    )
                 matching_tool = next(
                     (
                         tool['function']
