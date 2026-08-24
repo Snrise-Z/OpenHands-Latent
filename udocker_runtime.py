@@ -305,7 +305,15 @@ class UDockerRuntime(CLIRuntime):
         cwd_file = '/tmp/.oh_cwd'
         # Persist env+cwd across bash -c invocations via files inside the
         # container rootfs (which persists between udocker runs).
+        prelude = ''
+        _cenv = os.environ.get('OPENSWE_CONDA_ENV')
+        if _cenv:
+            # OpenSWE 镜像的 conda 在 /opt/conda,testbed 环境只在交互式 bashrc 里激活;
+            # 这里显式激活,否则 bash -c 跑到的是 base 环境的 python。
+            prelude = ('source /opt/conda/etc/profile.d/conda.sh >/dev/null 2>&1; '
+                       f'conda activate {_cenv} >/dev/null 2>&1; ')
         wrapped = (
+            prelude +
             f'[ -f {state} ] && source {state} >/dev/null 2>&1; '
             f'[ -f {cwd_file} ] && cd "$(cat {cwd_file})" 2>/dev/null; '
             f'{command}\n'

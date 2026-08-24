@@ -179,6 +179,11 @@ def get_instance_docker_image(
     instance_id: str,
     swebench_official_image: bool = False,
 ) -> str:
+    if os.environ.get('EVAL_IMAGE_STYLE') == 'openswe':
+        # OpenSWE 环境镜像:openswe-<owner>-<repo>-<PR号>,实例编号里的双下划线换成短横
+        prefix = os.environ.get('EVAL_DOCKER_IMAGE_PREFIX', 'docker.io/wentsegoogle/')
+        name = 'openswe-' + instance_id.replace('__', '-')
+        return (prefix.rstrip('/') + '/' + name + ':latest').lower()
     if swebench_official_image:
         # Official SWE-Bench image
         # swebench/sweb.eval.x86_64.django_1776_django-11333:v1
@@ -359,7 +364,11 @@ def initialize_runtime(
         logger.error(f'Failed to source ~/.bashrc: {str(obs)}')
     assert_and_raise(obs.exit_code == 0, f'Failed to source ~/.bashrc: {str(obs)}')
 
-    action = CmdRunAction(command=f'source /swe_util/{entry_script_path}')
+    _openswe_style = os.environ.get('EVAL_IMAGE_STYLE') == 'openswe'
+    # OpenSWE 镜像没有 /swe_util,准备工作由镜像自身完成
+    action = CmdRunAction(
+        command=('true' if _openswe_style else f'source /swe_util/{entry_script_path}')
+    )
     action.set_hard_timeout(600)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
@@ -369,7 +378,10 @@ def initialize_runtime(
         f'Failed to source /swe_util/{entry_script_path}: {str(obs)}',
     )
 
-    action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
+    # OpenSWE 的仓库固定在 /testbed,不在 /workspace 下
+    action = CmdRunAction(
+        command=('cd /testbed' if _openswe_style else f'cd /workspace/{workspace_dir_name}')
+    )
     action.set_hard_timeout(600)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
@@ -453,7 +465,10 @@ def complete_runtime(
     obs: CmdOutputObservation
     workspace_dir_name = _get_swebench_workspace_dir_name(instance)
 
-    action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
+    action = CmdRunAction(
+        command=('cd /testbed' if os.environ.get('EVAL_IMAGE_STYLE') == 'openswe'
+                 else f'cd /workspace/{workspace_dir_name}')
+    )
     action.set_hard_timeout(600)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
@@ -468,7 +483,10 @@ def complete_runtime(
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
 
         # Then run the command again
-        action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
+        action = CmdRunAction(
+        command=('cd /testbed' if os.environ.get('EVAL_IMAGE_STYLE') == 'openswe'
+                 else f'cd /workspace/{workspace_dir_name}')
+    )
         action.set_hard_timeout(600)
         logger.info(action, extra={'msg_type': 'ACTION'})
         obs = runtime.run_action(action)
@@ -483,7 +501,10 @@ def complete_runtime(
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
 
         # Then run the command again
-        action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
+        action = CmdRunAction(
+        command=('cd /testbed' if os.environ.get('EVAL_IMAGE_STYLE') == 'openswe'
+                 else f'cd /workspace/{workspace_dir_name}')
+    )
         action.set_hard_timeout(600)
         logger.info(action, extra={'msg_type': 'ACTION'})
         obs = runtime.run_action(action)
