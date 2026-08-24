@@ -40,6 +40,7 @@ from pathlib import Path
 
 from openhands.core.logger import openhands_logger as logger
 from openhands_aci.editor.editor import OHEditor
+from openhands_aci.editor.exceptions import EditorToolParameterInvalidError
 from openhands_aci.editor.exceptions import ToolError
 from openhands_aci.editor.results import CLIResult
 
@@ -148,6 +149,18 @@ def _reindent_to_window(window: str, old_str: str, new_str: str) -> str:
     return '\n'.join(out) + ('\n' if new_str.endswith('\n') else '')
 
 
+_IDENTICAL_HINT = (
+    'No replacement was performed: the `old_str` and `new_str` you provided are '
+    'byte-for-byte identical, so there is nothing to change. [fuzzy-hint] If you meant to '
+    'change indentation or whitespace, note that BOTH strings you sent carry the same '
+    'indentation. Re-read the region with `view` first, copy the file text verbatim into '
+    '`old_str` (watch for tabs vs spaces), and write the corrected text into `new_str`. '
+    'When re-indenting a block, include a few surrounding lines in both strings so that they '
+    'actually differ. Do not fall back to shell commands such as `sed -i` or `rm` to edit '
+    'source files: this workspace has no git history, so such edits cannot be undone.'
+)
+
+
 def _record(event: str, path='', **fields) -> None:
     """每次模糊层决策都记录:logger 一条,OH_FUZZY_LOG 设了再落一行 JSONL。
 
@@ -169,6 +182,21 @@ def _record(event: str, path='', **fields) -> None:
 
 class FuzzyOHEditor(OHEditor):
     """精确优先、失败后分层回退的 str_replace。"""
+
+    def __call__(self, *, command=None, path=None, old_str=None, new_str=None, **kwargs):
+        """把上游"新旧串完全相同"的通用拒绝换成可操作指引。
+
+        上游在参数分发处(调用 str_replace 之前)就抛 EditorToolParameterInvalidError,
+        原文只说两者必须不同,没告诉模型下一步怎么办。Verified 20 题实测:模型连撞五次后
+        转向 bash 的 sed -i / rm 硬改源文件,而 SWE-bench 容器剥掉了 .git,破坏不可逆
+        (两题因此把源文件删空或削残)。这里给出具体做法,把它引回编辑器通道。
+        """
+        if command == "str_replace" and old_str is not None and new_str == old_str:
+            _record("hint-identical-strs", path, chars=len(old_str or ""))
+            raise EditorToolParameterInvalidError("new_str", new_str, _IDENTICAL_HINT)
+        return super().__call__(
+            command=command, path=path, old_str=old_str, new_str=new_str, **kwargs
+        )
 
     def str_replace(
         self,
