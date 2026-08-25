@@ -182,6 +182,40 @@ _MISSING_HINTS = {
         'Resend with the lines you want added, keeping the indentation of the surrounding code.'),
 }
 
+# Invalid `path` / `view_range` 的可操作提示。实测(3500 组前 148 条轨迹): create 撞
+# "文件已存在" 69 次、路径不存在 32 次、view_range 越界 14 次, 上游只报状态不给出路。
+_PATH_HINTS = {
+    'exists': (
+        ' [hint] The file already exists, so `create` refuses to overwrite it. If you want to '
+        'change its content, use command=`str_replace` (with `old_str` copied verbatim from the '
+        'file) or command=`insert` (with `insert_line`); run command=`view` first to see what is '
+        'currently in it. Only pick a different path if you really need a second, separate file - '
+        'do not create variants like foo_v2.py or foo_fixed.py.'),
+    'missing': (
+        ' [hint] This path does not exist yet. To write a new file use command=`create` with '
+        '`file_text`; to inspect an existing one, check the directory first with '
+        'command=`view` on its parent folder (or `ls` via execute_bash) - the file may live '
+        'elsewhere in the repository, or the name may be misspelled.'),
+    'range': (
+        ' [hint] The file has fewer lines than the range you asked for (an empty file reports '
+        '[1, 0]). Call command=`view` without `view_range` to see the whole file and its real '
+        'length first; if the file is empty, there is nothing to read and you should write it '
+        'with command=`create` instead.'),
+}
+
+
+def _path_hint_for(msg: str) -> str:
+    """按上游错误原文挑一条可操作提示;认不出就不加。"""
+    m = (msg or '').lower()
+    if 'view_range' in m or 'should be within the range of lines' in m:
+        return _PATH_HINTS['range']
+    if 'already exists' in m:
+        return _PATH_HINTS['exists']
+    if 'does not exist' in m or 'no such file' in m or 'is not an absolute path' in m:
+        return _PATH_HINTS['missing']
+    return ''
+
+
 def _record(event: str, path='', **fields) -> None:
     """每次模糊层决策都记录:logger 一条,OH_FUZZY_LOG 设了再落一行 JSONL。
 
@@ -223,9 +257,20 @@ class FuzzyOHEditor(OHEditor):
             if _tip and _val is None:
                 _record("hint-missing-param", path, command=command, param=_param)
                 raise EditorToolParameterInvalidError(_param, None, _tip)
-        return super().__call__(
-            command=command, path=path, old_str=old_str, new_str=new_str, **kwargs
-        )
+        try:
+            return super().__call__(
+                command=command, path=path, old_str=old_str, new_str=new_str, **kwargs
+            )
+        except EditorToolParameterInvalidError as err:
+            tip = _path_hint_for(str(err))
+            if not tip:
+                raise
+            _record("hint-path", path, command=command,
+                    kind=("range" if "view_range" in str(err) else
+                          "exists" if "already exists" in str(err).lower() else "missing"))
+            raise EditorToolParameterInvalidError(
+                getattr(err, "parameter", "path"), getattr(err, "value", path),
+                str(getattr(err, "message", err)).split(": ", 1)[-1] + tip) from None
 
     def str_replace(
         self,
