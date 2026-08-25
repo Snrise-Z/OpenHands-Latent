@@ -31,13 +31,13 @@ FZ=$OH/openhands/runtime/latent_fuzzy_editor.py
 CR=$OH/openhands/runtime/impl/cli/cli_runtime.py
 grep -q "forgot to put the modification into" $FZ || { say "!! identical 提示未更新"; exit 1; }
 grep -q "_MISSING_HINTS" $FZ || { say "!! 参数缺失提示缺失"; exit 1; }
-grep -q "_uses_sed_inplace" $CR || { say "!! sed -i 禁用未生效"; exit 1; }
 grep -q "enable_history_truncation = false" $OH/config.toml || { say "!! 未设超窗即停"; exit 1; }
 $VENV/bin/python -c "
 import sys; sys.path.insert(0,'$OH')
-from openhands.runtime.impl.cli.cli_runtime import _uses_sed_inplace as B
+import inspect
+from openhands.runtime.impl.cli.cli_runtime import CLIRuntime as _CR
 from openhands.runtime.latent_fuzzy_editor import _IDENTICAL_HINT, _MISSING_HINTS
-assert B(\"sed -i 's/a/b/' x.py\") and not B(\"sed -n '1,2p' x.py\")
+assert 'sed' not in inspect.getsource(_CR.run).lower(), 'sed 拦截未彻底移除'
 assert 'forgot to put' in _IDENTICAL_HINT and len(_MISSING_HINTS) >= 4
 print('harness 闸门 OK')
 " 2>&1 | tee -a $L | grep -q OK || { say "!! harness 自检失败"; exit 1; }
@@ -47,11 +47,15 @@ from openhands.llm.swemaster_format import SYSTEM_PROMPT as S
 print(hashlib.md5(S.encode()).hexdigest()[:12], len(S))
 " 2>/dev/null)
 say "闸门通过 editor_md5=$(md5sum $FZ | cut -c1-12) runtime_md5=$(md5sum $CR | cut -c1-12) sysprompt=$SP_MD5"
-grep -q "In-place shell editing is disabled" $OH/openhands/llm/swemaster_format.py \
-  || { say "!! 系统提示未含 sed 禁令"; exit 1; }
+# 系统提示必须与模型训练时看到的逐字节一致 —— 它进每一次请求, 是「在训练分布下评测」
+# 这一说法的依据。查生效值而不是 grep 文件: 长度与 md5 都要对上。
+[ "$SP_MD5" = "701e9bd962e8 15496" ] || { say "!! 系统提示与训练不一致: 期望 [701e9bd962e8 15496], 实得 [$SP_MD5]"; exit 1; }
 grep -q "_PATH_HINTS" $FZ || { say "!! path 提示补丁缺失"; exit 1; }
 
-pgrep -f "mem_reaper2\.s[h]" >/dev/null || { setsid nohup bash $T/mem_reaper2.sh >/dev/null 2>&1 </dev/null & }
+# 只拉起「只看内存」的看门狗。mem_reaper2/3 按 6000 秒杀进程, 比驱动自己的
+# timeout 7200 还早, 会把跑长的题杀成无产出 —— 实测它被复活后在 19 点杀了 36 个、
+# 21 点又杀了 8 个。时长上限已由 timeout 与 EVAL_INSTANCE_TIMEOUT 负责, 不要重复。
+pgrep -f "mem_reaper\.s[h]" >/dev/null || { setsid nohup bash $T/mem_reaper.sh >/dev/null 2>&1 </dev/null & }
 pgrep -f "reaper_relaxed\.s[h]" >/dev/null || { setsid nohup bash $T/reaper_relaxed.sh >/dev/null 2>&1 </dev/null & }
 
 cd $OH

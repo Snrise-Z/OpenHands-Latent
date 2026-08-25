@@ -93,3 +93,33 @@ run_infer 会照常抽 git 补丁并把 error 写进产物 —— 停下, 且留
 验证: `EVAL_INSTANCE_TIMEOUT=150`、外部 900 的真实单题冒烟, 150 秒时抛出
 `EvalTimeoutException: Function timed out after 150 seconds`, 写出 1 行产物
 (`error="Timeout after 150 seconds"`), 容器正常回收, 进程干净退出。
+
+## 系统提示与 sed:回到训练分布
+
+`sed -i` 禁令与配套的系统提示改写已全部撤回。依据是三组同题对照:A(完全未改的
+harness)与 C(全套改动)在 262 题交集上 78 vs 80、差 2 题;B 与 C 在 156 题交集上
+50 vs 47、McNemar p = 0.701;而 C 相对 B 多出的 path/view_range 提示本轮触发了 995 次、
+涉及 239 题 —— 触发量很大却测不出任何分数差。翻转噪声底是 17%,配对差值标准差约
+3.4 个百分点,这个量级的改动本来也测不出来。
+
+既然拿不到收益,就不该为它付口径的代价:系统提示进每一次请求,偏离训练分布的成本
+是确定的,而 SWE-Master-4B-RL 正是在那份提示下做的 RL。
+
+因此:
+- `openhands/llm/swemaster_format.py` 的 `SYSTEM_PROMPT` 逐字节恢复成训练时的样子
+  (长度 15496,md5 前 12 位 701e9bd962e8)。驱动脚本的闸门断言这两个值,
+  查生效值而不是 grep 文件文本。
+- `cli_runtime.py` 里的 `sed -i` 拦截整段移除。自检改为反向断言:用
+  `inspect.getsource(CLIRuntime.run)` 确认运行时里不再残留 sed 相关逻辑。
+- 保留的是模糊层与三个无训练闸门 —— 它们只在模型已经犯错的那一步出现,不进入
+  正常步骤看到的输入。
+
+## 不要复活按时长杀进程的看门狗
+
+`mem_reaper2.sh` / `mem_reaper3.sh` 按 6000 秒杀掉匹配到的进程,比驱动自己给每题的
+`timeout -s TERM 7200` 还早。它们会把跑长的题杀成无产出 —— 实测被驱动的闸门段复活后,
+19 点杀了 36 个 rollout、21 点又杀了 8 个,直接制造「撞上限却一行产物都没有」。
+
+时长上限已经由外部 `timeout` 与 `EVAL_INSTANCE_TIMEOUT` 两层负责,不要再叠一层。
+驱动现在只拉起 `mem_reaper.sh`(只看内存,阈值 60G,排除 vLLM 与训练进程)——
+那个是有用的:实测抓到过三个各占 164 GB、已跑 2.7 天的孤儿测试进程。

@@ -30,6 +30,13 @@ export TMPDIR=/root/autodl-tmp/.tmp; mkdir -p "$TMPDIR"
 export VLLM_CACHE_ROOT=/root/autodl-tmp/.vllm_cache TRITON_CACHE_DIR=/root/autodl-tmp/.triton_cache
 export LD_LIBRARY_PATH=$VLLM_ENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}
 export no_proxy=localhost,127.0.0.1,::1; export NO_PROXY=$no_proxy
+
+# 单题的进程内超时, 必须小于驱动给每题的外部 timeout -s TERM(7200), 留出收尾余量。
+# 外部信号先到时进程被直接杀掉、一行产物都不留, 判分拿不到结论, 该题进重试计数,
+# 最终分母被削(实测 500 题里 50 个 output.jsonl 为空)。内部闹钟先响则会写出一行
+# 带 error 的确定结果。注意 evaluation/utils/shared.py 单 worker 分支原本漏传这个
+# 参数(已修), 两处配套才生效。
+export EVAL_INSTANCE_TIMEOUT=6600
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOGDIR/eval_driver.log"; }
