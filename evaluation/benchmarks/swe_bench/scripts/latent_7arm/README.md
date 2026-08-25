@@ -41,19 +41,26 @@ LD_LIBRARY_PATH。AutoDL 系统盘只剩几 GB,不改这些变量时 vLLM 会在
 启动时把 harness 的三个指纹写进日志作为闸门,换 harness 后指纹变化即可发现:
 编辑器模糊层、运行时、系统提示各一个 md5。
 
-## 超窗必须停下,而不是压缩后重试
+## 超窗必须停下, 而不是压缩后重试
 
-`config.lclm-eval.toml` 的 `[agent]` 段必须显式设 `enable_history_truncation = false`。
-它的默认值是 `true`,走的是「抛 ContextWindowExceededError 后发一个
-CondensationRequestAction」这条路;而本项目 `[condenser]` 是 `noop`,压缩器什么都不做,
-上下文仍然超窗,于是一步一个 condensation_request 空转到步数耗尽。实测 21 道题这样
-烧掉步数预算且全部未解决,首次触发中位在第 90 步,最多吃掉 24% 的预算。
+**设置点在 `run_infer.py` 的 `get_config`, 不在配置文件。** 该函数用
+`AgentConfig(...)` + `set_agent_config` 整体覆盖 `config.toml` 的 `[agent]` 段,
+所以配置文件里写 `enable_history_truncation = false` 到不了智能体, 用的是字段默认值
+`True`。默认值走的是「抛 ContextWindowExceededError -> 发 CondensationRequestAction」
+这条路, 而本项目 condenser 是 `noop`, 压缩器什么都不做、上下文仍然超窗, 于是一步一个
+`condensation_request` 空转到步数耗尽。实测 25 道题这样烧掉预算且全部未解决,
+首次触发中位在第 90 步, 最多吃掉 24% 的预算。
 
-设成 `false` 后改走 `raise LLMContextWindowExceedError`:智能体立刻停止,而该异常不在
-`evaluation/utils/shared.py` 的 `FATAL_EXCEPTIONS` 里,所以不会触发 run_infer 的重跑,
-run_infer 会照常抽取 git 补丁并把 error 写进产物 —— 停下,且留下结果。
+因此 `AgentConfig(...)` 里必须显式传 `enable_history_truncation=False`。传了之后改走
+`raise LLMContextWindowExceedError`: 智能体立刻停止, 且该异常不在
+`evaluation/utils/shared.py` 的 `FATAL_EXCEPTIONS` 里, 不会触发 run_infer 重跑,
+run_infer 会照常抽 git 补丁并把 error 写进产物 —— 停下, 且留下结果。
 
-对应地,`one_job` 的超窗守卫只记录不立刻杀:发现关键字后记一次账,给最多 `OVF_GRACE`
-秒(缺省 420)让 run_infer 完成抽补丁与写产物,仍不退出才强杀兜底。早先的版本一发现
-关键字就 SIGTERM 再 SIGKILL,会把这段收尾打断,产物丢失、判分拿不到结论,该题反而进
-重试计数 —— 与设 false 的目的正好相反。
+**闸门要查生效值, 不要 grep 配置文件。** 早先 driver 的闸门 grep `config.toml` 里那一行,
+文本在、闸门放行, 但值被 `set_agent_config` 覆盖掉了, 于是静默失效了整整一轮。
+现在 `get_config` 会打一行 `[harness-effective] enable_history_truncation=... `,
+闸门应当查这一行。
+
+对应地, `one_job` 的超窗守卫只记录不立刻杀: 发现关键字后记一次账, 给最多 `OVF_GRACE`
+秒(缺省 420)让 run_infer 完成抽补丁与写产物, 仍不退出才强杀兜底。原版一发现关键字
+就 SIGTERM 再 SIGKILL, 会把收尾打断, 产物丢失、判分无结论, 该题反而进重试计数。

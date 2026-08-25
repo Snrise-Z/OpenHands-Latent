@@ -263,12 +263,34 @@ def get_config(
         enable_mcp=False,
         condenser=metadata.condenser_config,
         enable_prompt_extensions=False,
+        # 超窗就停下, 不要压缩后接着重试。
+        # 注意这里必须显式传: 本函数用 set_agent_config 整体覆盖 config.toml 的
+        # [agent] 段, 所以配置文件里写的 enable_history_truncation = false 到不了
+        # 智能体, 用的是字段默认值 True。默认值走的是「抛 ContextWindowExceededError
+        # -> 发 CondensationRequestAction」这条路, 而本项目 condenser 是 noop,
+        # 压缩器什么都不做、上下文仍然超窗, 于是一步一个 condensation_request
+        # 空转到步数耗尽。实测 25 道题这样烧掉预算且全部未解决, 首次触发中位在
+        # 第 90 步, 最多吃掉 24%。
+        # 传 False 后改走 raise LLMContextWindowExceedError: 智能体立刻停止, 且该
+        # 异常不在 evaluation/utils/shared.py 的 FATAL_EXCEPTIONS 里, 不会触发重跑,
+        # run_infer 会照常抽 git 补丁并把 error 写进产物 —— 停下且留下结果。
+        enable_history_truncation=False,
         model_routing=model_routing_config,
         system_prompt_filename=metadata.agent_config.system_prompt_filename
         if metadata.agent_config
         else 'system_prompt.j2',
     )
     config.set_agent_config(agent_config)
+    # 把生效值打进日志: 这个 AgentConfig 覆盖了 config.toml 的 [agent] 段,
+    # 所以配置文件里写了什么并不代表智能体拿到什么。闸门应当查这一行,
+    # 而不是 grep 配置文件 —— 后者曾让 enable_history_truncation 静默失效。
+    _eff = config.get_agent_config(metadata.agent_class)
+    logger.info(
+        '[harness-effective] enable_history_truncation=%s enable_condensation_request=%s '
+        'enable_jupyter=%s enable_browsing=%s'
+        % (_eff.enable_history_truncation, _eff.enable_condensation_request,
+           _eff.enable_jupyter, _eff.enable_browsing)
+    )
 
     return config
 
