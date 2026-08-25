@@ -1,6 +1,10 @@
 #!/bin/bash
 # 3500 组(7 臂 x 500 题)全量评测, 新 harness(提交 5852af5)。
-# 阶段1: allhard(裸 vLLM);阶段2: 6 个 latent 臂共用一套 shim, 3000 组全局队列。
+# 七臂 x 500 题 = 3500 组, 单一全局队列, 七臂交错推进。
+# 全部跑在同一套 serve_shim 上: 裸 vLLM 与 shim 对同样的贪心请求会给出不同输出
+# (冷热缓存下分歧点相同, 各自内部确定), 根因是分块预填充粒度 8192 与 2048 之别,
+# 而 serve_shim 不暴露该参数。同栈才能让臂间对比不混入服务栈的影响。
+# 每题一条流水线: rollout 完立即判分, 不等其他题。
 # 每题一条流水线: rollout 完立即判分, 不等其他题。
 set -u
 T=/root/autodl-tmp
@@ -9,11 +13,11 @@ VENV=$T/envs/openhands-0620
 VLLM_ENV=$T/vllm-env
 LCLM=$T/LCLM
 BAKED=$T/swemd_final_eval
-ROOT=/root/autodl-fs/eval_swemd_7arm
+ROOT=/root/autodl-fs/eval_swemd_7arm_v2
 OUTB=$OH/evaluation/evaluation_outputs/outputs/princeton-nlp__SWE-bench_Verified-test/CodeActAgent
 L=$ROOT/driver.log
 IDS=/root/autodl-fs/eval_sets/verified_all500_ids.txt
-mkdir -p $ROOT/{logs,done,fuzzy_logs,shards,logs/serve}
+mkdir -p $ROOT/{logs,done,fuzzy_logs,shards,attempts,logs/serve}
 say() { echo "[$(date '+%F %T')] $*" | tee -a $L; }
 
 # 必须先 source: 它把 vLLM/Triton 缓存、TMPDIR、LD_LIBRARY_PATH 挪出系统盘(仅 3.7G 空闲),
@@ -23,7 +27,8 @@ export EVAL_ROOT=$ROOT LOGDIR=$ROOT/logs
 mkdir -p "$VLLM_CACHE_ROOT" "$TRITON_CACHE_DIR" "$TMPDIR" 2>/dev/null
 
 NG=$(nvidia-smi -L | wc -l)
-say "===== 3500 组评测开始(新 harness) NG=$NG ====="
+CONC=${CONC:-64}   # 全局并发
+say "===== 3500 组评测开始(单一全局队列, 七臂同栈) NG=$NG CONC=$CONC ====="
 say "缓存 VLLM_CACHE_ROOT=$VLLM_CACHE_ROOT TMPDIR=$TMPDIR 系统盘余 $(df -BG / | awk 'NR==2{print $4}')"
 
 # ---------- 闸门: 三处改动必须在位 ----------
@@ -162,64 +167,25 @@ start_stats() {   # start_stats <tag>; PID 写入全局 STATS_PID
 }
 
 # ================= 阶段 1: allhard(裸 vLLM) =================
-say "阶段1 起 $NG 个裸 vLLM(allhard)"
+SDIR=$T/serving/swemd_final_7arm
+say "构建 shim 服务目录(七臂共用同一套栈)"
+if [ -f "$SDIR/config.json" ]; then
+  say "  服务目录已在, 跳过构建"
+else
+  cd $LCLM && PYTHONPATH=$LCLM/latent_context/vllm_plugin $VLLM_ENV/bin/python -m vllm_lclm.build_serving_dir \
+    --eval-dir $BAKED --out $SDIR --repo-dir $LCLM > $ROOT/logs/serve/build.log 2>&1 \
+    || { say "!! build_serving_dir 失败"; exit 1; }
+fi
+say "起 $NG 个 shim 副本"
 for i in $(seq 0 $((NG-1))); do
   curl -s -m 3 --noproxy '*' http://127.0.0.1:$((8600+i))/v1/models 2>/dev/null | grep -q swe-master && {
     say "  副本 $i 已在, 跳过"; continue; }
-  CUDA_VISIBLE_DEVICES=$i setsid nohup $VLLM_ENV/bin/python -m vllm.entrypoints.openai.api_server \
-    --model $BAKED/decoder --served-model-name swe-master \
-    --port $((8600+i)) --max-model-len 131072 --gpu-memory-utilization 0.90 \
-    --enable-prefix-caching --max-num-seqs 16 \
-    --no-enable-log-requests --enable-prompt-tokens-details --enable-force-include-usage \
-    --override-generation-config '{"temperature":0.7,"top_p":0.8,"top_k":20,"min_p":0.0}' \
-    > $ROOT/logs/serve/vllm_$((8600+i)).log 2>&1 < /dev/null &
-done
-for w in $(seq 1 90); do
-  ok=0; for i in $(seq 0 $((NG-1))); do curl -s -m 3 --noproxy '*' -o /dev/null http://127.0.0.1:$((8600+i))/v1/models && ok=$((ok+1)); done
-  [ "$ok" -eq "$NG" ] && break; sleep 20
-done
-[ "${ok:-0}" -eq "$NG" ] || { say "!! 阶段1 仅 ${ok:-0}/$NG 就绪"; exit 1; }
-say "阶段1 $NG 副本就绪, 500 题并发 64"
-: > $ROOT/q1.txt
-# 优先队列: $ROOT/priority.txt 里的题排到最前(用于补齐跨轮对照所需的题)
-k=0
-if [ -s "$ROOT/priority.txt" ]; then
-  while read -r iid; do
-    [ -n "$iid" ] && echo "allhard $iid $((k % NG)) sm" >> $ROOT/q1.txt && k=$((k+1))
-  done < $ROOT/priority.txt
-  say "优先队列 $k 题排在最前"
-fi
-while read -r iid; do
-  [ -z "$iid" ] && continue
-  grep -qxF "$iid" "$ROOT/priority.txt" 2>/dev/null && continue
-  echo "allhard $iid $((k % NG)) sm" >> $ROOT/q1.txt; k=$((k+1))
-done < $IDS
-start_stats 阶段1; SP=$STATS_PID
-cat $ROOT/q1.txt | xargs -P 64 -L1 bash -c 'one_job "$@"' _
-kill $SP 2>/dev/null
-# 完成度闸门: 队列里每一题都要有 done 标记才算这一阶段真的结束。
-# xargs 若被人为杀掉或异常退出, 这里会拦住, 不会误入阶段 2(踩过一次: 杀 xargs
-# 导致主脚本顺势杀光 vLLM 并开始构建 shim)。
-MISS=$(awk '{print $1"-"$2}' $ROOT/q1.txt | while read -r t; do [ -f "$ROOT/done/$t" ] || echo x; done | wc -l)
-if [ "$MISS" -gt 0 ]; then
-  say "!! 阶段1 尚有 $MISS 题无 done 标记, 判定为未完成, 不进入阶段2。"
-  say "   vLLM 保持运行; 排查后重跑本脚本即可续跑(已完成的题会自动跳过)。"
-  exit 1
-fi
-say "阶段1 完成: $(ls $ROOT/done | wc -l)/500"
-pkill -f "vllm.entrypoints.openai.api_serve[r]"; sleep 30
-
-# ================= 阶段 2: 6 个 latent 臂(shim) =================
-SDIR=$T/serving/swemd_final_7arm
-say "阶段2 构建 shim 服务目录"
-cd $LCLM && PYTHONPATH=$LCLM/latent_context/vllm_plugin $VLLM_ENV/bin/python -m vllm_lclm.build_serving_dir \
-  --eval-dir $BAKED --out $SDIR --repo-dir $LCLM > $ROOT/logs/serve/build.log 2>&1 \
-  || { say "!! build_serving_dir 失败"; exit 1; }
-for i in $(seq 0 $((NG-1))); do
   CUDA_VISIBLE_DEVICES=$i PYTHONPATH=$LCLM/latent_context/vllm_plugin \
     setsid nohup $VLLM_ENV/bin/python -m vllm_lclm.serve_shim \
     --serving-dir $SDIR --port $((8600+i)) --max-model-len 131072 \
-    --gpu-memory-utilization 0.88 --max-num-seqs 24 \
+    --gpu-memory-utilization 0.88 --max-num-seqs 24 --kv-cache-dtype auto \
+    --max-num-batched-tokens 8192 --enable-prefix-caching 1 \
+    --default-top-p 0.8 --default-top-k 20 --default-min-p 0.0 \
     --metrics-log $ROOT/logs/serve/metrics_$((8600+i)).jsonl \
     > $ROOT/logs/serve/shim_$((8600+i)).log 2>&1 < /dev/null &
 done
@@ -227,22 +193,48 @@ for w in $(seq 1 90); do
   ok=0; for i in $(seq 0 $((NG-1))); do curl -s -m 3 --noproxy '*' -o /dev/null http://127.0.0.1:$((8600+i))/v1/models && ok=$((ok+1)); done
   [ "$ok" -eq "$NG" ] && break; sleep 20
 done
-[ "${ok:-0}" -eq "$NG" ] || { say "!! 阶段2 仅 ${ok:-0}/$NG shim 就绪"; exit 1; }
-say "阶段2 $NG shim 副本就绪, 3000 组全局队列并发 48"
+[ "${ok:-0}" -eq "$NG" ] || { say "!! 仅 ${ok:-0}/$NG shim 就绪"; exit 1; }
+# 闸门: 查引擎实际生效的分块预填充上限, 不是查命令行写了什么。
+# 这个值不显式设会被多模态路径压到编码器预算(实测 2048), 与裸 vLLM 的 8192 不同,
+# 会改变浮点归约顺序进而改变贪心输出 —— 必须确认真的是 8192。
+MNBT=$(grep -o "max_num_batched_tokens=[0-9]*" $ROOT/logs/serve/shim_8600.log | head -1 | cut -d= -f2)
+[ "${MNBT:-0}" = "8192" ] || { say "!! 生效的 max_num_batched_tokens=${MNBT:-未知}, 期望 8192"; exit 1; }
+PFX=$(grep -o "enable_prefix_caching=[A-Za-z]*" $ROOT/logs/serve/shim_8600.log | head -1 | cut -d= -f2)
+say "引擎生效值 max_num_batched_tokens=$MNBT enable_prefix_caching=$PFX"
+say "$NG 个 shim 就绪, 3500 组单一全局队列, 并发 $CONC"
 cd $OH
-: > $ROOT/q2.txt
+# 单一全局队列: 按题为主序, 每道题连出七个臂 -> 七臂的完成数同步增长,
+# 不会出现一个臂全跑完才轮到下一个。副本按题号绑定, 同一道题的七个臂落在同一副本,
+# 共享该题问题陈述的前缀, 前缀缓存命中更好。全部用 shim 配置 sml。
+# 队列先写本地盘再整体拷到共享盘: 共享盘是网络文件系统, 逐行 >> 实测只有约
+# 2.6 行/秒, 3500 行要 22 分钟。整段一次重定向再拷贝, 一秒内完成。
+QTMP=$TMPDIR/q_$$.txt
 k=0
-while read -r iid; do
-  [ -z "$iid" ] && continue
-  for arm in alllatent hardlast8 hardlast4 hardlast3 hardlast2 hardlast1; do
-    echo "$arm $iid $((k % NG)) sml" >> $ROOT/q2.txt; k=$((k+1))
-  done
-done < $IDS
-start_stats 阶段2; SP=$STATS_PID
-cat $ROOT/q2.txt | xargs -P 48 -L1 bash -c 'one_job "$@"' _
+{
+  while read -r iid; do
+    [ -z "$iid" ] && continue
+    for arm in allhard alllatent hardlast8 hardlast4 hardlast3 hardlast2 hardlast1; do
+      echo "$arm $iid $((k % NG)) sml"
+    done
+    k=$((k+1))
+  done < $IDS
+} > $QTMP
+cp $QTMP $ROOT/q.txt
+say "队列 $(wc -l < $ROOT/q.txt) 组(七臂 x $(wc -l < $IDS) 题)"
+
+start_stats 全局; SP=$STATS_PID
+cat $ROOT/q.txt | xargs -P $CONC -L1 bash -c 'one_job "$@"' _
 kill $SP 2>/dev/null
-MISS2=$(awk '{print $1"-"$2}' $ROOT/q2.txt | while read -r t; do [ -f "$ROOT/done/$t" ] || echo x; done | wc -l)
-[ "$MISS2" -gt 0 ] && say "!! 阶段2 尚有 $MISS2 组无 done 标记(汇总仍会输出, 但不完整)"
+
+# 完成度闸门: 逐组核对 done 标记。xargs 退出不等于跑完 —— 被 kill、被信号中断都会
+# 正常退出, 这里拦住才不会把「没跑完」当成「跑完了」。
+MISS=$(awk '{print $1"-"$2}' $ROOT/q.txt | while read -r t; do [ -f "$ROOT/done/$t" ] || echo x; done | wc -l)
+if [ "$MISS" -gt 0 ]; then
+  say "!! 尚有 $MISS 组无 done 标记, 判定为未完成。"
+  say "   shim 保持运行; 排查后重跑本脚本即可续跑(已完成的组会自动跳过)。"
+  exit 1
+fi
+say "全部 $(ls $ROOT/done | wc -l) 组完成"
 
 # ================= 汇总 =================
 $VENV/bin/python - <<'PYEOF' 2>&1 | tee -a $L

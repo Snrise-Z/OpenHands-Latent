@@ -123,3 +123,28 @@ harness)与 C(全套改动)在 262 题交集上 78 vs 80、差 2 题;B 与 C 在
 时长上限已经由外部 `timeout` 与 `EVAL_INSTANCE_TIMEOUT` 两层负责,不要再叠一层。
 驱动现在只拉起 `mem_reaper.sh`(只看内存,阈值 60G,排除 vLLM 与训练进程)——
 那个是有用的:实测抓到过三个各占 164 GB、已跑 2.7 天的孤儿测试进程。
+
+## 服务栈参数必须全部显式传
+
+七臂现在跑在同一套 `serve_shim` 上。原因是裸 vLLM 与 shim 对同样的贪心请求会给出
+不同输出:实测三条用例分别从第 173 / 126 / 413 字符起分歧,冷缓存与预热后的分歧点
+完全相同,各栈自身连问三次又逐字一致 —— 确定性差异,不是采样噪声。
+
+逐键比对两边生效配置(引擎配置 33 键、29 键相同)后,唯一一处「没显式传而落到不同
+默认值」是 `max_num_batched_tokens`:裸 vLLM 8192,shim 2048。2048 是 vLLM 因为
+`limit_mm_per_prompt` 把模型当多模态、按编码器缓存预算压出来的,`serve_shim` 从未过问。
+它决定分块预填充的批形状,进而决定浮点归约顺序与核函数选择。
+
+现在 `serve_shim` 把引擎侧(`max_num_batched_tokens` / `enable_prefix_caching` /
+`max_num_seqs` / `kv_cache_dtype`)与采样侧(请求未给 `top_p`/`top_k`/`min_p` 时用显式
+默认补齐)全部显式传,驱动也逐项传进去。
+
+**闸门查生效值,不查命令行。** 驱动在 shim 起来后从引擎日志读实际的
+`max_num_batched_tokens`,不等于 8192 就退出:
+
+```bash
+MNBT=$(grep -o "max_num_batched_tokens=[0-9]*" $ROOT/logs/serve/shim_8600.log | head -1 | cut -d= -f2)
+[ "${MNBT:-0}" = "8192" ] || { say "!! 生效的 max_num_batched_tokens=${MNBT:-未知}, 期望 8192"; exit 1; }
+```
+
+命令行写了 8192 不等于引擎会用 8192 —— 多模态路径本来就有权把它压下去。
