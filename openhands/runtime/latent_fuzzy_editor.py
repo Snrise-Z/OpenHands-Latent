@@ -150,16 +150,37 @@ def _reindent_to_window(window: str, old_str: str, new_str: str) -> str:
 
 
 _IDENTICAL_HINT = (
-    'No replacement was performed: the `old_str` and `new_str` you provided are '
-    'byte-for-byte identical, so there is nothing to change. [fuzzy-hint] If you meant to '
-    'change indentation or whitespace, note that BOTH strings you sent carry the same '
-    'indentation. Re-read the region with `view` first, copy the file text verbatim into '
-    '`old_str` (watch for tabs vs spaces), and write the corrected text into `new_str`. '
-    'When re-indenting a block, include a few surrounding lines in both strings so that they '
-    'actually differ. Do not fall back to shell commands such as `sed -i` or `rm` to edit '
-    'source files: this workspace has no git history, so such edits cannot be undone.'
+    'No replacement was performed: your `new_str` is byte-for-byte identical to `old_str`, '
+    'so this edit would change nothing. It looks like you forgot to put the modification into '
+    '`new_str` - check whether you left out the lines you meant to add, remove or rewrite, then '
+    'resend with `new_str` containing the intended result. (If you did mean to change only '
+    'indentation or whitespace: both strings you sent carry the same indentation, so re-read the '
+    'region with `view`, copy the file text verbatim into `old_str` watching for tabs vs spaces, '
+    'and put the re-indented text in `new_str`.) Do not fall back to shell commands such as '
+    '`sed -i` to edit source files: they are blocked for repository sources in this environment.'
 )
 
+
+# 参数缺失时上游只说"缺某参数", 不给下一步。实测(Verified 500 题)失败题的参数缺失
+# 是解决题的 6 倍, 集中在 create 少 file_text、insert 少 insert_line/new_str。
+_MISSING_HINTS = {
+    ('create', 'file_text'): (
+        'Parameter `file_text` is required for `create`: it holds the full content of the new '
+        'file. Resend the same call with `file_text` set to the complete text you want written '
+        '(not a diff, not a description). If you meant to modify an existing file instead, use '
+        '`str_replace` with `old_str`/`new_str`.'),
+    ('str_replace', 'old_str'): (
+        'Parameter `old_str` is required for `str_replace`: it is the exact text to be replaced. '
+        'Use `view` on the file first, copy the target lines verbatim (including indentation) '
+        'into `old_str`, and put the replacement into `new_str`.'),
+    ('insert', 'insert_line'): (
+        'Parameter `insert_line` is required for `insert`: it is the 1-based line number AFTER '
+        'which `new_str` is inserted (use 0 to insert at the top). Run `view` to find the line '
+        'number first.'),
+    ('insert', 'new_str'): (
+        'Parameter `new_str` is required for `insert`: it is the text to insert at `insert_line`. '
+        'Resend with the lines you want added, keeping the indentation of the surrounding code.'),
+}
 
 def _record(event: str, path='', **fields) -> None:
     """每次模糊层决策都记录:logger 一条,OH_FUZZY_LOG 设了再落一行 JSONL。
@@ -194,6 +215,14 @@ class FuzzyOHEditor(OHEditor):
         if command == "str_replace" and old_str is not None and new_str == old_str:
             _record("hint-identical-strs", path, chars=len(old_str or ""))
             raise EditorToolParameterInvalidError("new_str", new_str, _IDENTICAL_HINT)
+        for _param, _val in (("file_text", kwargs.get("file_text")),
+                             ("old_str", old_str),
+                             ("insert_line", kwargs.get("insert_line")),
+                             ("new_str", new_str)):
+            _tip = _MISSING_HINTS.get((command, _param))
+            if _tip and _val is None:
+                _record("hint-missing-param", path, command=command, param=_param)
+                raise EditorToolParameterInvalidError(_param, None, _tip)
         return super().__call__(
             command=command, path=path, old_str=old_str, new_str=new_str, **kwargs
         )

@@ -2,6 +2,7 @@
 It does not implement browser functionality.
 """
 
+import re
 import asyncio
 import os
 import select
@@ -85,6 +86,27 @@ After installing .NET SDK, restart your terminal and try again.
 
         # Exit the program with an error code
         sys.exit(1)
+
+
+# ---- 全面禁用 sed -i 原地改写(Verified 500 题实测: 失败题用 31 次, 解决题仅 4 次且全在
+# 同一道题; 20 题实验里 sed -i 曾把源文件削残, 而 SWE-bench 容器剥掉了 .git, 破坏不可逆。
+# 一律改走 str_replace_editor; 只读用法 sed -n '10,20p' 不受影响)----
+_SED_INPLACE_RE = re.compile(
+    r"\bsed\b[^;&|\n]*?(?:\s-[A-Za-z]*i[A-Za-z]*(?:\.\S+)?\b|--in-place)", re.I)
+_SED_BLOCKED_MSG = (
+    "ERROR: `sed -i` (in-place editing) is disabled in this environment. This workspace has no "
+    "git history, so an in-place edit that goes wrong cannot be undone. "
+    "Use the `str_replace_editor` tool instead: command=`str_replace` with `old_str` copied "
+    "verbatim from the file (run command=`view` first to get the exact text, watching tabs vs "
+    "spaces) and `new_str` holding the intended result; command=`insert` with `insert_line` to "
+    "add new lines; command=`create` with `file_text` to write a whole file. "
+    "Read-only sed such as `sed -n '10,20p' file.py` still works."
+)
+
+
+def _uses_sed_inplace(command: str) -> bool:
+    """命令中是否含 sed 原地改写(-i / --in-place, 含 -i.bak、-ni 等粘连写法)。"""
+    return bool(_SED_INPLACE_RE.search(command or ''))
 
 
 class CLIRuntime(Runtime):
@@ -447,6 +469,8 @@ class CLIRuntime(Runtime):
 
     def run(self, action: CmdRunAction) -> Observation:
         """Run a command using subprocess."""
+        if _uses_sed_inplace(getattr(action, 'command', '') or ''):
+            return ErrorObservation(content=_SED_BLOCKED_MSG)
         if not self._runtime_initialized:
             return ErrorObservation(
                 f'Runtime not initialized for command: {action.command}'
