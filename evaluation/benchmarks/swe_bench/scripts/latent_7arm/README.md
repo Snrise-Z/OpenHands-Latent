@@ -64,3 +64,32 @@ run_infer 会照常抽 git 补丁并把 error 写进产物 —— 停下, 且留
 对应地, `one_job` 的超窗守卫只记录不立刻杀: 发现关键字后记一次账, 给最多 `OVF_GRACE`
 秒(缺省 420)让 run_infer 完成抽补丁与写产物, 仍不退出才强杀兜底。原版一发现关键字
 就 SIGTERM 再 SIGKILL, 会把收尾打断, 产物丢失、判分无结论, 该题反而进重试计数。
+
+## 单题超时必须由进程内的闹钟先响
+
+驱动脚本给每题套了外部 `timeout -s TERM 7200`。如果进程内的单题超时比它更晚(或者
+根本没装上), 外部信号先到、进程被直接杀掉, 这道题**一行产物都不留** —— 判分拿不到
+结论, 该题进重试计数, 最终分母被削。实测本轮 500 题里 50 个 `output.jsonl` 为空、
+71 题进过 `timeout.txt`。
+
+这里原本有两层问题, 都已修:
+
+1. `evaluation/utils/shared.py` 的 `run_evaluation`: 多 worker 分支把 `timeout_seconds`
+   传给了 `_process_instance_wrapper`, **单 worker 分支漏传**, 于是取缺省 `None`,
+   `with timeout(...)` 整段被跳过。评测用 `--eval-num-workers 1`, 正好落在这条路上,
+   所以那个闹钟从来没装上过, `EvalTimeoutException` 那段一直是死代码。
+2. `run_infer.py` 把 `timeout_seconds` 写死成 8 小时, 比外部的 2 小时还长。现改为读
+   环境变量 `EVAL_INSTANCE_TIMEOUT`, 缺省仍是 8 小时。
+
+**两处必须配套**: 只补第 1 处, 超时仍是 8 小时、外部还是先到; 只改第 2 处, 参数传不下去。
+
+用法: 驱动脚本设 `EVAL_INSTANCE_TIMEOUT` 为略小于外部超时的值(例如外部 7200 时设
+6600), 让内部闹钟先响。
+
+**已知局限**: 走内部超时返回的 `EvalOutput` 里 `test_result={}`、`history` 为空,
+拿到的是「一条确定的未解决结果」, 不是抢救出补丁。它解决的是分母诚实与停止重试,
+不是提分。要连补丁一起保住, 需要在超时路径里补一次 `complete_runtime`, 那是更大的改动。
+
+验证: `EVAL_INSTANCE_TIMEOUT=150`、外部 900 的真实单题冒烟, 150 秒时抛出
+`EvalTimeoutException: Function timed out after 150 seconds`, 写出 1 行产物
+(`error="Timeout after 150 seconds"`), 容器正常回收, 进程干净退出。

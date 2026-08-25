@@ -549,6 +549,11 @@ def run_evaluation(
                     metadata=metadata,
                     use_mp=False,
                     max_retries=max_retries,
+                    # 上游这里漏了 timeout_seconds: 多 worker 分支通过 args_iter 传了,
+                    # 单 worker 分支没传, 于是取缺省 None, `with timeout(...)` 被跳过,
+                    # 单题超时从未装上。评测用 --eval-num-workers 1, 正好落在这条路上,
+                    # 结果是撞外部 timeout 时进程被直接杀掉、一行产物都不留。
+                    timeout_seconds=timeout_seconds,
                 )
                 update_progress(result, pbar, output_fp)
 
