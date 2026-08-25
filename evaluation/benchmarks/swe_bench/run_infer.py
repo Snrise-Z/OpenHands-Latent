@@ -208,6 +208,28 @@ def get_instance_docker_image(
         return (docker_image_prefix.rstrip('/') + '/' + image_name).lower()
 
 
+def _instance_timeout_seconds() -> int:
+    """单题的进程内超时(秒)。
+
+    必须设得比驱动脚本的外部 `timeout -s TERM` 更短, 否则外部信号先到、进程被直接
+    杀掉, 这道题连一行产物都不会留下 —— 判分拿不到结论, 该题进重试计数, 最终分母
+    被削。内部闹钟先响时, evaluation/utils/shared.py 会 catch EvalTimeoutException
+    并返回一个带 error 的 EvalOutput, 那一行会被正常写出, 于是拿到的是一个确定的
+    结果而不是空洞。
+
+    缺省保持上游的 8 小时不变; 批量评测时由驱动脚本设 EVAL_INSTANCE_TIMEOUT。
+    """
+    raw = os.environ.get('EVAL_INSTANCE_TIMEOUT', '').strip()
+    if raw:
+        try:
+            v = int(raw)
+            if v > 0:
+                return v
+        except ValueError:
+            logger.warning(f'EVAL_INSTANCE_TIMEOUT 不是正整数, 忽略: {raw!r}')
+    return 8 * 60 * 60
+
+
 def get_config(
     instance: pd.Series,
     metadata: EvalMetadata,
@@ -926,9 +948,7 @@ if __name__ == '__main__':
             output_file,
             args.eval_num_workers,
             process_instance,
-            timeout_seconds=8
-            * 60
-            * 60,  # 8 hour PER instance should be more than enough
+            timeout_seconds=_instance_timeout_seconds(),
             max_retries=5,
         )
     else:
@@ -975,9 +995,7 @@ if __name__ == '__main__':
                 cur_output_file,
                 args.eval_num_workers,
                 process_instance,
-                timeout_seconds=8
-                * 60
-                * 60,  # 8 hour PER instance should be more than enough
+                timeout_seconds=_instance_timeout_seconds(),
                 max_retries=5,
             )
 
