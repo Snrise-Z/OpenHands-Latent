@@ -147,6 +147,15 @@ timeout = 2400
 enable_browsing = false
 enable_jupyter = false
 enable_llm_editor = false
+# 超窗就停下, 不要压缩后接着重试。
+# 默认值是 true, 走的是「抛 ContextWindowExceededError -> 发 CondensationRequestAction」
+# 这条路; 而本文件的 [condenser] 是 noop, 压缩器什么都不做, 上下文仍然超窗, 于是
+# 一步一个 condensation_request 空转到步数耗尽。实测 21 道题这样烧掉步数预算,
+# 全部未解决, 首次触发中位在第 90 步, 最多吃掉 24% 的预算。
+# 设成 false 后改走 raise LLMContextWindowExceedError 分支: 智能体立刻停止,
+# 该异常不在 evaluation/utils/shared.py 的 FATAL_EXCEPTIONS 里, 所以不会触发
+# run_infer 的重跑, 而是照常抽取 git 补丁并把 error 写进产物 —— 停下且留下结果。
+enable_history_truncation = false
 
 [condenser]
 type = "noop"

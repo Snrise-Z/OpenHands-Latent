@@ -84,10 +84,21 @@ one_job() {
     --eval-num-workers 1 --eval-note "a7-$tag" \
     --dataset princeton-nlp/SWE-bench_Verified --split test > $RLOG 2>&1 &
   RPID=$!
+  # 超窗守卫: 只记录并留出收尾时间, 不再一发现就杀。
+  # 配置已设 enable_history_truncation=false, 超窗会抛 LLMContextWindowExceedError,
+  # 智能体自行停止, run_infer 随后照常抽 git 补丁并把 error 写进产物。若在这段收尾
+  # 期间把进程杀掉, 产物会丢失、判分拿不到结论、该题反而进重试计数。
+  # 因此: 记一次账 -> 等它自己退出(最多 OVF_GRACE 秒)-> 仍不退才强杀兜底。
+  OVF_GRACE=${OVF_GRACE:-420}
   ( while kill -0 $RPID 2>/dev/null; do
       grep -qiE "maximum context length|context_length_exceeded|ContextWindowExceed|LLMContextWindowExceed" $RLOG 2>/dev/null && {
         echo "$arm $iid" >> $ROOT/context_overflow.txt
-        kill -TERM $RPID 2>/dev/null; sleep 10; kill -KILL $RPID 2>/dev/null; break; }
+        w=0
+        while kill -0 $RPID 2>/dev/null && [ $w -lt $OVF_GRACE ]; do sleep 10; w=$((w+10)); done
+        kill -0 $RPID 2>/dev/null && {
+          echo "$arm $iid grace-expired" >> $ROOT/context_overflow.txt
+          kill -TERM $RPID 2>/dev/null; sleep 10; kill -KILL $RPID 2>/dev/null; }
+        break; }
       sleep 20
     done ) & WPID=$!
   wait $RPID 2>/dev/null; RC=$?
