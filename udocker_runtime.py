@@ -136,11 +136,29 @@ def _ensure_template(image_ref: str) -> Path | None:
             fcntl.flock(lf, fcntl.LOCK_UN)
 
 
+# 克隆的成本在元数据而不在数据: reflink 让 2.7G 数据块免拷贝, 但 cp -a 仍要逐个建
+# 72,125 个 inode 和目录项。driver 一次派发 64 个以上任务时, 数百万次文件创建会在
+# 同一个 XFS 卷的日志与分配组上串行化 —— 实测容器准备中位 190s、最长 459s, 而同一个
+# 克隆单独跑只要 1.8s。8 路并发时克隆吞吐已饱和(1.07 个每秒), 再加宽只增延迟不增
+# 吞吐, 所以这里只给克隆这一步加并发闸, 任务总并发保持不变。
+_CLONE_SLOTS = int(os.environ.get('UDOCKER_CLONE_SLOTS', '8'))
+
+
+def _clone_cmd(src_dir: str, dst_dir: str) -> list:
+    """给 cp 套并发闸。flock 缺失或闸门关掉时退回裸 cp(只是慢, 不会失败)。"""
+    cp = ['cp', '-a', '--reflink=always', src_dir, dst_dir]
+    if _CLONE_SLOTS <= 0 or not shutil.which('flock'):
+        return cp
+    slot = uuid.uuid4().int % _CLONE_SLOTS
+    lock = os.path.join(UDOCKER_CONTAINERS, '.clone.%d.lock' % slot)
+    return ['flock', lock] + cp
+
+
 def _clone_from_template(tdir: Path, name: str) -> bool:
     """cp -a --reflink the template into a fresh container id and register the name symlink."""
     new_id = str(uuid.uuid4())
     dst = Path(UDOCKER_CONTAINERS) / new_id
-    r = subprocess.run(['cp', '-a', '--reflink=always', str(tdir / 'src'), str(dst)],
+    r = subprocess.run(_clone_cmd(str(tdir / 'src'), str(dst)),
                        capture_output=True, text=True)
     if r.returncode != 0:
         shutil.rmtree(dst, ignore_errors=True)
