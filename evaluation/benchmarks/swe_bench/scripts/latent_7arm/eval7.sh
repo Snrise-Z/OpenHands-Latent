@@ -117,9 +117,13 @@ one_job() {
   N=$(wc -l < "$D/output.jsonl" 2>/dev/null || echo 0)
   R=NA
   if [ "$N" -ge 1 ]; then
-    $VENV/bin/python evaluation/benchmarks/swe_bench/eval_infer.py \
+    # 判分必须有时限。没有时限时实测会卡在加载完预测之后的一次 socket 读上永不返回
+    # (最长 37 小时), 把 xargs 槽位永久占住, 整轮评测因此停滞。单题判分正常几分钟,
+    # 最重的仓库也在十几分钟内, 一小时是很宽的上界。-k 60 保证 TERM 无效时补 KILL。
+    timeout -s TERM -k 60 3600 $VENV/bin/python evaluation/benchmarks/swe_bench/eval_infer.py \
       --input-file "$D/output.jsonl" --dataset princeton-nlp/SWE-bench_Verified --split test \
       --eval-num-workers 1 > $ROOT/logs/grade_$tag.log 2>&1
+    [ $? -eq 124 ] && echo "$arm $iid" >> $ROOT/grade_timeout.txt
     R=$(python3 -c "
 import json
 try:
@@ -178,7 +182,8 @@ else
 fi
 say "起 $NG 个 shim 副本"
 for i in $(seq 0 $((NG-1))); do
-  curl -s -m 3 --noproxy '*' http://127.0.0.1:$((8600+i))/v1/models 2>/dev/null | grep -q swe-master && {
+  # 判据不能写死模型名 —— 服务目录里的 id 是 qwen3-4b-2507, 匹配 swe-master 永远为假。
+  curl -s -m 3 --noproxy '*' http://127.0.0.1:$((8600+i))/v1/models 2>/dev/null | grep -q '"object":"model"' && {
     say "  副本 $i 已在, 跳过"; continue; }
   CUDA_VISIBLE_DEVICES=$i PYTHONPATH=$LCLM/latent_context/vllm_plugin \
     setsid nohup $VLLM_ENV/bin/python -m vllm_lclm.serve_shim \
@@ -197,9 +202,22 @@ done
 # 闸门: 查引擎实际生效的分块预填充上限, 不是查命令行写了什么。
 # 这个值不显式设会被多模态路径压到编码器预算(实测 2048), 与裸 vLLM 的 8192 不同,
 # 会改变浮点归约顺序进而改变贪心输出 —— 必须确认真的是 8192。
-MNBT=$(grep -o "max_num_batched_tokens=[0-9]*" $ROOT/logs/serve/shim_8600.log | head -1 | cut -d= -f2)
+VREC=$ROOT/logs/serve/verified_effective.txt
+MNBT=$(grep -o "max_num_batched_tokens=[0-9]*" $ROOT/logs/serve/shim_8600.log 2>/dev/null | head -1 | cut -d= -f2)
+PFX=$(grep -o "enable_prefix_caching=[A-Za-z]*" $ROOT/logs/serve/shim_8600.log 2>/dev/null | head -1 | cut -d= -f2)
+if [ -n "$MNBT" ]; then
+  # 日志里有引擎配置行: 读生效值, 并把结论连同进程身份存档, 供下次复用 shim 时取证。
+  SPID=$(pgrep -f "serve_shim.*--port 8600" | head -1)
+  echo "$SPID $(stat -c %Y /proc/${SPID:-0} 2>/dev/null) $MNBT $PFX" > $VREC
+else
+  # 日志被截断。只要存档里那个进程还活着且启动时刻没变, 当前服务的就仍是当初验过的同一批引擎。
+  read -r SPID SST MNBT PFX < $VREC 2>/dev/null
+  NOW=$(stat -c %Y /proc/${SPID:-0} 2>/dev/null)
+  { [ -n "${SPID:-}" ] && [ -n "$NOW" ] && [ "$NOW" = "$SST" ]; } \
+    || { say "!! 无法确认生效的 max_num_batched_tokens(shim 日志已截断, 且存档与在跑进程对不上)"; exit 1; }
+  say "  shim 日志已被截断, 改用存档核验: pid=$SPID 启动时刻未变, 仍是验过的那批引擎"
+fi
 [ "${MNBT:-0}" = "8192" ] || { say "!! 生效的 max_num_batched_tokens=${MNBT:-未知}, 期望 8192"; exit 1; }
-PFX=$(grep -o "enable_prefix_caching=[A-Za-z]*" $ROOT/logs/serve/shim_8600.log | head -1 | cut -d= -f2)
 say "引擎生效值 max_num_batched_tokens=$MNBT enable_prefix_caching=$PFX"
 say "$NG 个 shim 就绪, 3500 组单一全局队列, 并发 $CONC"
 cd $OH
