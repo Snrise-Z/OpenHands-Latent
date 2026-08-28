@@ -241,12 +241,20 @@ cp $QTMP $ROOT/q.txt
 say "队列 $(wc -l < $ROOT/q.txt) 组(七臂 x $(wc -l < $IDS) 题)"
 
 start_stats 全局; SP=$STATS_PID
-cat $ROOT/q.txt | xargs -P $CONC -L1 bash -c 'one_job "$@"' _
+# 队列最多自动跑 3 遍: 无结论的组每遍重试一次(done 标记的组直接跳过),
+# 判分偶发卡壳不再需要人工重新拉驱动 —— v2 与教师两轮各被人工重启了 2-3 次, 全是这一步。
+MISS=0
+for PASS in 1 2 3; do
+  say "队列第 $PASS 遍"
+  cat $ROOT/q.txt | xargs -P $CONC -L1 bash -c 'one_job "$@"' _
+  MISS=$(awk '{print $1"-"$2}' $ROOT/q.txt | while read -r t; do [ -f "$ROOT/done/$t" ] || echo x; done | wc -l)
+  [ "$MISS" -eq 0 ] && break
+  say "第 $PASS 遍后仍缺 $MISS 组, 自动续跑"
+done
 kill $SP 2>/dev/null
 
 # 完成度闸门: 逐组核对 done 标记。xargs 退出不等于跑完 —— 被 kill、被信号中断都会
 # 正常退出, 这里拦住才不会把「没跑完」当成「跑完了」。
-MISS=$(awk '{print $1"-"$2}' $ROOT/q.txt | while read -r t; do [ -f "$ROOT/done/$t" ] || echo x; done | wc -l)
 if [ "$MISS" -gt 0 ]; then
   say "!! 尚有 $MISS 组无 done 标记, 判定为未完成。"
   say "   shim 保持运行; 排查后重跑本脚本即可续跑(已完成的组会自动跳过)。"
@@ -256,7 +264,7 @@ say "全部 $(ls $ROOT/done | wc -l) 组完成"
 
 # ================= 汇总 =================
 $VENV/bin/python - <<'PYEOF' 2>&1 | tee -a $L
-import json, glob, re
+import json, glob, os, re
 from collections import defaultdict
 agg = defaultdict(lambda: [0, 0])
 for g in glob.glob("/root/autodl-tmp/OpenHands-Latent/evaluation/evaluation_outputs/outputs/*/CodeActAgent/*a7-*/output.swebench_eval.jsonl"):
@@ -275,6 +283,6 @@ for arm in ("allhard", "hardlast8", "hardlast4", "hardlast3", "hardlast2", "hard
     ok, n = agg.get(arm, [0, 0])
     print("  %-12s %3d / %3d  %.1f%%" % (arm, ok, n, 100.0*ok/max(n,1)))
 json.dump({k: {"resolved": v[0], "n": v[1]} for k, v in agg.items()},
-          open("/root/autodl-fs/eval_swemd_7arm/summary.json", "w"), indent=1)
+          open(os.environ["EVAL_ROOT"] + "/summary.json", "w"), indent=1)
 PYEOF
 say "EVAL7_ALL_DONE"

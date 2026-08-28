@@ -203,17 +203,24 @@ if [ ! -f $ROOT/.smoke_ok ]; then
   say "冒烟通过($okc/2), 放行全量"
 fi
 
-cat $ROOT/q.txt | xargs -P $CONC -L1 bash -c 'one_job "$@"' _
+# 队列最多自动跑 3 遍: 无结论的组每遍重试一次(done 标记的组直接跳过)。
+MISS=0
+for PASS in 1 2 3; do
+  say "队列第 $PASS 遍"
+  cat $ROOT/q.txt | xargs -P $CONC -L1 bash -c 'one_job "$@"' _
+  MISS=$(awk '{print $1"-"$2}' $ROOT/q.txt | while read -r t; do [ -f "$ROOT/done/$t" ] || echo x; done | wc -l)
+  [ "$MISS" -eq 0 ] && break
+  say "第 $PASS 遍后仍缺 $MISS 组, 自动续跑"
+done
 
 # ---------- 完成度闸门与汇总 ----------
-MISS=$(awk '{print $1"-"$2}' $ROOT/q.txt | while read -r t; do [ -f "$ROOT/done/$t" ] || echo x; done | wc -l)
 if [ "$MISS" -gt 0 ]; then
   say "!! 尚有 $MISS 组无 done 标记, 判定为未完成; 重跑本脚本即可续跑"
   exit 1
 fi
 say "全部 $(ls $ROOT/done | wc -l) 组完成"
 $VENV/bin/python - <<'PYEOF' 2>&1 | tee -a $L
-import json, glob
+import json, glob, os
 ok = n = 0
 for g in glob.glob("/root/autodl-tmp/OpenHands-Latent/evaluation/evaluation_outputs/outputs/*/CodeActAgent/*N_swemorig-*/output.swebench_eval.jsonl"):
     for line in open(g, errors="ignore"):
@@ -225,6 +232,6 @@ for g in glob.glob("/root/autodl-tmp/OpenHands-Latent/evaluation/evaluation_outp
         n += 1; ok += bool(rep.get("resolved"))
 print("=== SWE-Master-4B-RL 原始模型 x 现行 harness ===")
 print("  resolved %d / %d = %.1f%%" % (ok, n, 100.0*ok/max(n,1)))
-json.dump({"resolved": ok, "n": n}, open("/root/autodl-fs/eval_swemorig_500/summary.json", "w"))
+json.dump({"resolved": ok, "n": n}, open(os.environ["EVAL_ROOT"] + "/summary.json", "w"))
 PYEOF
 say "SWEMORIG_ALL_DONE"

@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import os
+import signal
 import tempfile
 from typing import Any, Literal
 
@@ -27,6 +28,7 @@ from evaluation.utils.shared import (
     EvalException,
     EvalMetadata,
     EvalOutput,
+    EvalTimeoutException,
     assert_and_raise,
     check_maximum_retries_exceeded,
     codeact_user_response,
@@ -705,25 +707,39 @@ def process_instance(
     runtime = create_runtime(config)
     call_async_from_sync(runtime.connect)
 
+    eval_timeout_err: str | None = None
     try:
         initialize_runtime(runtime, instance, metadata)
 
         message_action = get_instruction(instance, metadata)
 
         # Here's how you can run the agent (similar to the `main` function) and get the final task state
-        state: State | None = asyncio.run(
-            run_controller(
-                config=config,
-                initial_user_action=message_action,
-                runtime=runtime,
-                fake_user_response_fn=AGENT_CLS_TO_FAKE_USER_RESPONSE_FN[
-                    metadata.agent_class
-                ],
+        try:
+            state: State | None = asyncio.run(
+                run_controller(
+                    config=config,
+                    initial_user_action=message_action,
+                    runtime=runtime,
+                    fake_user_response_fn=AGENT_CLS_TO_FAKE_USER_RESPONSE_FN[
+                        metadata.agent_class
+                    ],
+                )
             )
-        )
+        except EvalTimeoutException as e:
+            # 单题闹钟在 rollout 中途响了。不能直接抛: 那会把工作区里已有的修改一并
+            # 丢掉(实测教师轮 66 组、v2 轮 58 组因此零产物, 其中教师 5 题三连超时被
+            # 封盘)。这里记下超时, 给抢救阶段重新上一个短闹钟, 然后照常走
+            # complete_runtime 把 git 补丁抽出来交给判分 —— 部分补丁也可能已经解题。
+            eval_timeout_err = str(e)
+            state = None
+            signal.alarm(int(os.environ.get('EVAL_SALVAGE_TIMEOUT', '300')))
+            logger.warning(
+                f'Instance {instance.instance_id} rollout timed out; '
+                f'salvaging git patch before cleanup.'
+            )
 
         # if fatal error, throw EvalError to trigger re-run
-        if is_fatal_evaluation_error(state.last_error):
+        if eval_timeout_err is None and is_fatal_evaluation_error(state.last_error):
             raise EvalException('Fatal error detected: ' + state.last_error)
 
         # ======= THIS IS SWE-Bench specific =======
@@ -742,6 +758,23 @@ def process_instance(
     finally:
         runtime.close()
     # ==========================================
+
+    if eval_timeout_err is not None:
+        signal.alarm(0)   # 抢救闹钟解除; 外层 timeout 上下文的 finally 会再清一次
+        logger.warning(
+            f'Instance {instance.instance_id}: salvaged git patch of '
+            f'{len(git_patch or "")} bytes after rollout timeout.'
+        )
+        return EvalOutput(
+            instance_id=instance.instance_id,
+            instruction='',
+            instance=instance.to_dict(),
+            test_result={'git_patch': git_patch},
+            metadata=metadata,
+            history=[],
+            metrics=None,
+            error=f'Timeout after rollout: {eval_timeout_err} [git patch salvaged before cleanup]',
+        )
 
     # ======= Attempt to evaluate the agent's edits =======
     # we use eval_infer.sh to evaluate the agent's edits, not here

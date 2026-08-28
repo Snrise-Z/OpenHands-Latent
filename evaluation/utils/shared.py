@@ -82,7 +82,12 @@ class EvalException(Exception):
     pass
 
 
-class EvalTimeoutException(Exception):
+class EvalTimeoutException(BaseException):
+    # 继承 BaseException 而不是 Exception: 闹钟响时控制流多半在 run_controller /
+    # agent_controller 的宽 except Exception 里(core/main.py 与 agent_controller.py
+    # 共 5 处), 继承 Exception 会被就地吞掉变成普通的 last_error, 运行继续烧到外层
+    # timeout 7200 被 SIGTERM 杀死, 一行产物都留不下(教师轮 57 组、v2 轮 68 组皆此路)。
+    # 改成 BaseException 后宽 except 全部放行, 只有显式写明本异常的 handler 才接得住。
     pass
 
 
