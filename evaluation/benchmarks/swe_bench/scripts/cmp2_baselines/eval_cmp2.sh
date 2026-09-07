@@ -160,22 +160,36 @@ export OBS_TOKENIZER=$SDIR          # 计量口径 = 本家族解码器分词器
 export OH VENV OUTB T L ROOT CFG MAXIT PFX SERVED_ID VLLM_CACHE_ROOT TRITON_CACHE_DIR TMPDIR LD_LIBRARY_PATH
 
 # 判分要访问 GitHub raw(SWE-bench harness 按提交拉 requirements / environment.yml)。这台机器直连时通时断
-# (冒烟时直连全部超时, 上一轮 500 题里也有 5 题因此判分失败), AutoDL 学术代理(/etc/network_turbo)多数时候可用。
-# 判分前探路: 直连 -> 代理 -> 等 60 秒再探, 最多 10 分钟; 判分日志出现网络错误则换路再判一次。
-# rollout 本身只访问本机服务, 不走代理。
+# (冒烟时直连全部超时, 上一轮 500 题里也有 5 题因此判分失败)。按用户要求, 网络问题用 `clash on` 起代理
+# (mihomo, 127.0.0.1:7890, 不做 TLS 拦截, GitHub raw 约 1 秒); 它会悄悄死掉, 所以每次判分前探测, 掉了就重新拉起。
+# 路线顺序: clash -> 直连 -> AutoDL 学术代理(做 TLS 拦截, 需系统证书链) -> 等 60 秒再探, 最多 10 分钟;
+# 判分日志出现网络错误则换路再判一次。rollout 本身只访问本机服务, 不走代理。
 GH_PROBE=https://raw.githubusercontent.com/django/django/419a78300f7cd27611196e1e464d50fd0385ff27/setup.py
+CLASH_PROXY=http://127.0.0.1:7890
 TURBO_PROXY=$(bash -c 'source /etc/network_turbo >/dev/null 2>&1; echo ${https_proxy:-}')
+clash_ensure() {   # 7890 通则返回 0; 否则用 clashctl on 拉起(幂等)再探一次; 加锁防并发重复拉起
+  curl -s -m 8 -x "$CLASH_PROXY" -o /dev/null -f "$GH_PROBE" && return 0
+  ( flock -w 120 9 || exit 1
+    curl -s -m 8 -x "$CLASH_PROXY" -o /dev/null -f "$GH_PROBE" && exit 0
+    echo "[$(date '+%F %T')] clash 不通, 重新拉起" >> $ROOT/clash_restart.log
+    bash -c 'source /root/tools/mihomo/script/common.sh && source /root/tools/mihomo/script/clashctl.sh && clashctl on' >> $ROOT/clash_restart.log 2>&1
+    sleep 5
+    curl -s -m 8 -x "$CLASH_PROXY" -o /dev/null -f "$GH_PROBE"
+  ) 9>$ROOT/.clash.lock
+}
 pick_route() {   # 输出可用路线(空串 = 直连, 否则为代理 URL); 十分钟内都不通返回 1
   local i
   for i in $(seq 1 10); do
+    clash_ensure && { echo "$CLASH_PROXY"; return 0; }
     env -u http_proxy -u https_proxy curl -s -m 10 -o /dev/null -f "$GH_PROBE" && { echo ""; return 0; }
     [ -n "$TURBO_PROXY" ] && curl -s -m 15 -x "$TURBO_PROXY" -o /dev/null -f "$GH_PROBE" && { echo "$TURBO_PROXY"; return 0; }
     sleep 60
   done
   return 1
 }
-export GH_PROBE TURBO_PROXY; export -f pick_route
-say "判分路线探测: 直连=$(env -u http_proxy -u https_proxy curl -s -m 10 -o /dev/null -w '%{http_code}' $GH_PROBE) 代理($TURBO_PROXY)=$(curl -s -m 15 -x "$TURBO_PROXY" -o /dev/null -w '%{http_code}' $GH_PROBE)"
+export GH_PROBE CLASH_PROXY TURBO_PROXY; export -f clash_ensure pick_route
+clash_ensure >/dev/null 2>&1
+say "判分路线探测: clash=$(curl -s -m 8 -x $CLASH_PROXY -o /dev/null -w '%{http_code}' $GH_PROBE) 直连=$(env -u http_proxy -u https_proxy curl -s -m 10 -o /dev/null -w '%{http_code}' $GH_PROBE) 学术代理($TURBO_PROXY)=$(curl -s -m 15 -x "$TURBO_PROXY" -o /dev/null -w '%{http_code}' $GH_PROBE)"
 
 one_job() {   # one_job <臂> <题号> <卡号>; 配置 ${CFG}<卡号>, 端口 8600+<卡号>
   arm=$1; iid=$2; rep=$3
@@ -223,7 +237,7 @@ one_job() {   # one_job <臂> <题号> <卡号>; 配置 ${CFG}<卡号>, 端口 8
       route=$(pick_route) || { echo "$arm $iid 判分前十分钟内 GitHub 不可达, 仍按直连尝试" >> $ROOT/grade_netfail.txt; route=""; }
       # 学术代理做 TLS 拦截, requests 默认的 certifi 证书链验不过(实测 SSLCertVerificationError), 走代理时改用系统证书链
       # (含 /usr/local/share/ca-certificates/autodl-signed.crt); venv 的 certifi 也已追加该 CA, 这里是双保险。
-      cab=""; [ -n "$route" ] && cab=/etc/ssl/certs/ca-certificates.crt
+      cab=""; [ -n "$route" ] && [ "$route" = "$TURBO_PROXY" ] && cab=/etc/ssl/certs/ca-certificates.crt
       # 判分必须有时限(无时限时实测卡在 socket 读上 37 小时占死槽位); -k 60 保证 TERM 无效时补 KILL
       # 用 env 传变量: 由参数展开得到的 "NAME=值" 词不会被 bash 当作前缀赋值, 直接写会被当成命令名
       env http_proxy=$route https_proxy=$route HTTP_PROXY=$route HTTPS_PROXY=$route \
